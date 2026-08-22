@@ -1,0 +1,128 @@
+// Progreso de transferencia en stderr (línea con \\r).
+import std/io;
+import std/time;
+
+/// Progress meter: known total, bytes done, timestamps.
+pub struct Meter {
+    total: int,
+    done: int,
+    started_ms: int,
+    last_print_ms: int,
+    label: string,
+}
+
+pub fn start(label: string, total: int) -> Meter {
+    let now = time.monotonic();
+    Meter {
+        total: total,
+        done: 0,
+        started_ms: now,
+        last_print_ms: 0,
+        label: label,
+    }
+}
+
+/// Compact size format: `11 B`, `1.5 KiB`, `5.5 MiB`, …
+pub fn format_bytes(n: int) -> string {
+    if (n < 1024) {
+        return to_string(n) + " B";
+    }
+    if (n < 1048576) {
+        let x = n * 10 / 1024;
+        return to_string(x / 10) + "." + to_string(x % 10) + " KiB";
+    }
+    if (n < 1073741824) {
+        let x = n * 10 / 1048576;
+        return to_string(x / 10) + "." + to_string(x % 10) + " MiB";
+    }
+    let x = n * 10 / 1073741824;
+    to_string(x / 10) + "." + to_string(x % 10) + " GiB"
+}
+
+fn pct(done: int, total: int) -> int {
+    if (total <= 0) { return 100; }
+    if (done >= total) { return 100; }
+    done * 100 / total
+}
+
+fn rate_bps(done: int, elapsed_ms: int) -> int {
+    if (elapsed_ms <= 0) { return 0; }
+    done * 1000 / elapsed_ms
+}
+
+fn eta_ms(done: int, total: int, elapsed_ms: int) -> int {
+    if (done <= 0 || elapsed_ms <= 0 || done >= total) { return 0; }
+    let rem = total - done;
+    rem * elapsed_ms / done
+}
+
+fn render_line(m: Meter) -> string {
+    let now_elapsed = time.monotonic() - m.started_ms;
+    let rate = rate_bps(m.done, now_elapsed);
+    var line = "\r" + m.label + "  " + format_bytes(m.done);
+    if (m.total > 0) {
+        line = line + " / " + format_bytes(m.total) + " (" + to_string(pct(m.done, m.total)) + "%)";
+    }
+    if (rate > 0) {
+        line = line + "  " + format_bytes(rate) + "/s";
+    }
+    if (m.total > 0 && m.done > 0 && m.done < m.total) {
+        let eta = eta_ms(m.done, m.total, now_elapsed);
+        if (eta > 0) {
+            line = line + "  ETA " + time.format_duration(eta);
+        }
+    }
+    // relleno para borrar restos de una línea más larga
+    line + "    "
+}
+
+/// Updates bytes done; reprints at most ~8 times/s.
+pub fn tick(m: Meter, done: int) -> Meter {
+    var meter = m;
+    meter.done = done;
+    let now = time.monotonic();
+    if (meter.last_print_ms == 0 || now - meter.last_print_ms >= 125 || done >= meter.total) {
+        match (io.ewrite(render_line(meter))) {
+            Result.Ok(_) => { },
+            Result.Err(_) => { },
+        }
+        meter.last_print_ms = now;
+    }
+    meter
+}
+
+/// Closes the progress line with a newline.
+pub fn finish(m: Meter) {
+    let final_m = Meter {
+        total: m.total,
+        done: m.total,
+        started_ms: m.started_ms,
+        last_print_ms: m.last_print_ms,
+        label: m.label,
+    };
+    match (io.ewrite(render_line(final_m) + "\n")) {
+        Result.Ok(_) => { },
+        Result.Err(_) => { },
+    }
+}
+
+/// Maps runtime timeout errors to a clear English message.
+pub fn map_io_err(e: string) -> string {
+    if (e == "read timeout" || e.contains("tiempo de espera")) {
+        "timed out (no activity on the channel)"
+    } else {
+        e
+    }
+}
+
+@test
+fn format_bytes_samples() {
+    assert(format_bytes(11) == "11 B");
+    assert(format_bytes(1536) == "1.5 KiB");
+    assert(format_bytes(5 * 1048576 + 524288) == "5.5 MiB");
+}
+
+@test
+fn map_timeout() {
+    assert(map_io_err("read timeout").contains("timed out"));
+}

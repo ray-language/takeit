@@ -1,0 +1,96 @@
+// Framing length-prefixed sobre un socket TCP (u32 BE + payload).
+import std/net;
+import progress;
+
+/// Connection with a leftover buffer (`socket_read_bytes` may overshoot).
+pub struct Conn {
+    handle: int,
+    buf: bytes,
+}
+
+pub fn from_handle(h: int) -> Conn {
+    Conn { handle: h, buf: b"" }
+}
+
+/// Sets (ms > 0) or clears (ms <= 0) the socket read/accept timeout.
+pub fn set_timeout(c: Conn, timeout_ms: int) -> Conn {
+    net.set_read_timeout(c.handle, timeout_ms);
+    c
+}
+
+pub fn close_conn(c: Conn) {
+    close(c.handle);
+}
+
+fn be32(n: int) -> bytes {
+    bytes_of([(n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255])
+}
+
+fn read_be32(b: bytes) -> int {
+    ((b[0] & 255) << 24) | ((b[1] & 255) << 16) | ((b[2] & 255) << 8) | (b[3] & 255)
+}
+
+/// Reads exactly `n` octets (accumulates socket reads).
+pub fn read_exact(c: Conn, n: int) -> Result<(Conn, bytes), string> {
+    var conn = c;
+    var err = "";
+    while (err.len() == 0 && conn.buf.len() < n) {
+        match (net.socket_read_bytes(conn.handle)) {
+            Result.Ok(chunk) => {
+                if (chunk.len() == 0) {
+                    err = "connection closed before read completed";
+                } else {
+                    conn = Conn { handle: conn.handle, buf: conn.buf + chunk };
+                }
+            },
+            Result.Err(e) => { err = progress.map_io_err(e); },
+        }
+    }
+    if (err.len() > 0) {
+        Result.Err(err)
+    } else {
+        let out = conn.buf.sub_bytes(0, n);
+        let rest = conn.buf.sub_bytes(n, conn.buf.len());
+        Result.Ok((Conn { handle: conn.handle, buf: rest }, out))
+    }
+}
+
+pub fn write_all(c: Conn, data: bytes) -> Result<Conn, string> {
+    match (net.socket_write_bytes(c.handle, data)) {
+        Result.Ok(_) => Result.Ok(c),
+        Result.Err(e) => Result.Err(progress.map_io_err(e)),
+    }
+}
+
+/// Writes `u32 BE length` + `payload`.
+pub fn write_frame(c: Conn, payload: bytes) -> Result<Conn, string> {
+    let hdr = be32(payload.len());
+    match (write_all(c, hdr + payload)) {
+        Result.Ok(c2) => Result.Ok(c2),
+        Result.Err(e) => Result.Err(e),
+    }
+}
+
+/// Reads one frame; rejects payloads larger than `max_len`.
+pub fn read_frame(c: Conn, max_len: int) -> Result<(Conn, bytes), string> {
+    match (read_exact(c, 4)) {
+        Result.Err(e) => Result.Err(e),
+        Result.Ok(pair) => {
+            let (c1, hdr) = pair;
+            let n = read_be32(hdr);
+            if (n < 0 || n > max_len) {
+                Result.Err("frame too large: " + to_string(n))
+            } else {
+                read_exact(c1, n)
+            }
+        },
+    }
+}
+
+@test
+fn be32_roundtrip() {
+    let n = 123456789;
+    assert(read_be32(be32(n)) == n);
+    assert(read_be32(be32(0)) == 0);
+    assert(read_be32(be32(65535)) == 65535);
+}

@@ -1,0 +1,161 @@
+// Revisión de fileread sobre fs.read_bytes/fs.seek: exactitud de los trozos, reanudación,
+// bordes (archivo vacío, trozo mayor que el archivo, offset pasado del final) y errores.
+import fileread;
+import std/fs;
+
+fn write_sample(path: string, size: int) {
+    var data = b"";
+    var i = 0;
+    // Contenido no uniforme: si un trozo se repitiera o se saltara, se notaría.
+    while (i < size) {
+        data = data + bytes_of([65 + (i - (i / 26) * 26)]);
+        i = i + 1;
+    }
+    match (fs.write_file_bytes(path, data)) {
+        Result.Ok(_) => { },
+        Result.Err(e) => panic(e),
+    }
+}
+
+@test
+fn chunks_are_exact_and_cover_the_file() {
+    let path = "/tmp/takeit_chunk_a.bin";
+    // 1000 octetos con trozos de 64: 15 llenos y una cola de 40.
+    write_sample(path, 1000);
+    var sizes: [int] = [];
+    var joined = b"";
+    match (fileread.for_each_chunk(path, 64, fn(piece: bytes) -> Result<int, string> {
+        sizes.push(piece.len());
+        joined = joined + piece;
+        Result.Ok(0)
+    })) {
+        Result.Err(e) => panic(e),
+        Result.Ok(_) => { },
+    }
+    assert_eq(sizes.len(), 16);
+    var i = 0;
+    while (i < 15) {
+        assert_eq(sizes[i], 64);
+        i = i + 1;
+    }
+    assert_eq(sizes[15], 40);
+    // Y lo leído es EXACTAMENTE el archivo, en orden.
+    assert_eq(joined.len(), 1000);
+    match (fs.read_file_bytes(path)) {
+        Result.Ok(original) => assert(joined == original),
+        Result.Err(e) => panic(e),
+    }
+    let _ = fs.remove_file(path);
+}
+
+@test
+fn resuming_reads_only_the_tail() {
+    let path = "/tmp/takeit_chunk_b.bin";
+    write_sample(path, 300);
+    var joined = b"";
+    match (fileread.for_each_chunk_from(path, 250, 64, fn(piece: bytes) -> Result<int, string> {
+        joined = joined + piece;
+        Result.Ok(0)
+    })) {
+        Result.Err(e) => panic(e),
+        Result.Ok(_) => { },
+    }
+    assert_eq(joined.len(), 50);
+    match (fs.read_file_bytes(path)) {
+        Result.Ok(original) => assert(joined == original.sub_bytes(250, 300)),
+        Result.Err(e) => panic(e),
+    }
+    let _ = fs.remove_file(path);
+}
+
+@test
+fn the_edges_behave() {
+    let path = "/tmp/takeit_chunk_c.bin";
+    // Archivo vacío: ni un solo trozo.
+    write_sample(path, 0);
+    var count = 0;
+    let _ = fileread.for_each_chunk(path, 16, fn(piece: bytes) -> Result<int, string> {
+        count = count + 1;
+        Result.Ok(0)
+    });
+    assert_eq(count, 0);
+    // Trozo mayor que el archivo: un único trozo, del tamaño del archivo.
+    write_sample(path, 10);
+    var sizes: [int] = [];
+    let _ = fileread.for_each_chunk(path, 4096, fn(piece: bytes) -> Result<int, string> {
+        sizes.push(piece.len());
+        Result.Ok(0)
+    });
+    assert_eq(sizes.len(), 1);
+    assert_eq(sizes[0], 10);
+    // Parámetros imposibles: error, no un bucle infinito ni un cero silencioso.
+    match (fileread.for_each_chunk(path, 0, fn(p: bytes) -> Result<int, string> { Result.Ok(0) })) {
+        Result.Ok(_) => panic("chunk_size 0 debería fallar"),
+        Result.Err(_) => { },
+    }
+    match (fileread.for_each_chunk_from(path, -1, 8, fn(p: bytes) -> Result<int, string> { Result.Ok(0) })) {
+        Result.Ok(_) => panic("un offset negativo debería fallar"),
+        Result.Err(_) => { },
+    }
+    // Un archivo que no existe: error del open, no un éxito vacío.
+    match (fileread.for_each_chunk("/tmp/takeit_no_existe.bin", 8, fn(p: bytes) -> Result<int, string> { Result.Ok(0) })) {
+        Result.Ok(_) => panic("un archivo inexistente debería fallar"),
+        Result.Err(_) => { },
+    }
+    let _ = fs.remove_file(path);
+}
+
+@test
+fn a_failing_receiver_stops_the_read() {
+    let path = "/tmp/takeit_chunk_d.bin";
+    write_sample(path, 1000);
+    var seen = 0;
+    match (fileread.for_each_chunk(path, 64, fn(piece: bytes) -> Result<int, string> {
+        seen = seen + 1;
+        if (seen == 3) { Result.Err("el receptor se cayó") } else { Result.Ok(0) }
+    })) {
+        Result.Ok(_) => panic("el fallo del receptor debería propagarse"),
+        Result.Err(e) => assert_eq(e, "el receptor se cayó"),
+    }
+    // Y no se sigue leyendo tras el fallo.
+    assert_eq(seen, 3);
+    let _ = fs.remove_file(path);
+}
+
+@test
+fn starting_past_the_end_is_not_a_silent_success() {
+    let path = "/tmp/takeit_chunk_e.bin";
+    write_sample(path, 100);
+    var count = 0;
+    let outcome = fileread.for_each_chunk_from(path, 500, 16, fn(p: bytes) -> Result<int, string> {
+        count = count + 1;
+        Result.Ok(0)
+    });
+    assert_eq(count, 0);
+    // Reanudar más allá del final es un error de programa, no "no hay nada que enviar".
+    match (outcome) {
+        Result.Ok(_) => panic("un offset pasado del final debería fallar"),
+        Result.Err(_) => { },
+    }
+    let _ = fs.remove_file(path);
+}
+
+@test
+fn the_total_is_what_the_caller_would_have_counted() {
+    let path = "/tmp/takeit_chunk_f.bin";
+    write_sample(path, 700);
+    match (fileread.for_each_chunk(path, 128, fn(p: bytes) -> Result<int, string> { Result.Ok(0) })) {
+        Result.Err(e) => panic(e),
+        Result.Ok(total) => assert_eq(total, 700),
+    }
+    // Y desde un offset, lo que queda por leer.
+    match (fileread.for_each_chunk_from(path, 700, 128, fn(p: bytes) -> Result<int, string> { Result.Ok(0) })) {
+        Result.Err(e) => panic(e),
+        Result.Ok(total) => assert_eq(total, 0),
+    }
+    match (fileread.for_each_chunk_from(path, 500, 128, fn(p: bytes) -> Result<int, string> { Result.Ok(0) })) {
+        Result.Err(e) => panic(e),
+        Result.Ok(total) => assert_eq(total, 200),
+    }
+    let _ = fs.remove_file(path);
+}

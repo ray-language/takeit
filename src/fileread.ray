@@ -1,0 +1,85 @@
+// Lectura por streaming de un archivo (sin cargarlo entero en RAM).
+// Sobre fs.read_bytes/fs.seek (raylang M113): los trozos salen EXACTOS de `chunk_size`
+// (el último puede ser menor) directamente del handle — sin `cat` externo, sin reensamblado,
+// memoria acotada por UN trozo y errores como valores desde el open.
+import std/fs;
+
+/// Calls `on_chunk(piece)` for each piece of exactly `chunk_size` bytes (last may be
+/// smaller) and returns the total number of bytes read. Memory bounded by one chunk.
+pub fn for_each_chunk(
+    path: string,
+    chunk_size: int,
+    on_chunk: fn(bytes) -> Result<int, string>
+) -> Result<int, string> {
+    for_each_chunk_from(path, 0, chunk_size, on_chunk)
+}
+
+/// Like `for_each_chunk`, starting at byte offset `start` — resume an interrupted
+/// transfer without re-reading (or re-sending) what the receiver already has. Returns the
+/// bytes read from `start` on; `Err` if `start` is past the end of the file.
+pub fn for_each_chunk_from(
+    path: string,
+    start: int,
+    chunk_size: int,
+    on_chunk: fn(bytes) -> Result<int, string>
+) -> Result<int, string> {
+    if (chunk_size <= 0) {
+        return Result.Err("invalid chunk_size");
+    }
+    if (start < 0) {
+        return Result.Err("invalid start offset");
+    }
+    // Reanudar más allá del final no es "no queda nada": es un offset equivocado (el
+    // receptor dijo tener más de lo que hay). Sin esto, la transferencia no enviaría nada
+    // y diría que fue bien. Empezar JUSTO en el final sí es legítimo: ya está todo.
+    match (fs.file_size(path)) {
+        Result.Ok(size) => {
+            if (start > size) {
+                return Result.Err(
+                    "start offset ${start} is past the end of ${path} (${size} bytes)"
+                );
+            }
+        },
+        Result.Err(_) => { },
+    }
+    match (fs.open(path, "r")) {
+        Result.Err(e) => Result.Err(e),
+        Result.Ok(h) => {
+            var err = "";
+            var total = 0;
+            if (start > 0) {
+                match (fs.seek(h, start)) {
+                    Result.Err(e) => {
+                        err = e;
+                    },
+                    Result.Ok(_) => { },
+                }
+            }
+            var go = err.len() == 0;
+            while (go) {
+                match (fs.read_bytes(h, chunk_size)) {
+                    Result.Err(e) => {
+                        err = e;
+                        go = false;
+                    },
+                    Result.Ok(opt) => match (opt) {
+                        Option.None => {
+                            go = false;
+                        },
+                        Option.Some(piece) => match (on_chunk(piece)) {
+                            Result.Err(e) => {
+                                err = e;
+                                go = false;
+                            },
+                            Result.Ok(_) => {
+                                total = total + piece.len();
+                            },
+                        },
+                    },
+                }
+            }
+            let _ = close(h);
+            if (err != "") { Result.Err(err) } else { Result.Ok(total) }
+        },
+    }
+}

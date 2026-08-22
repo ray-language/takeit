@@ -1,0 +1,241 @@
+// Protocolo takeit v1: hello, auth, chunks AEAD, done.
+import std/crypto;
+import framing;
+import kdf;
+
+pub const VERSION: int = 1;
+pub const SALT_LEN: int = 16;
+/// 256 KiB: fewer AEAD frames and better throughput on large files.
+pub const DEFAULT_CHUNK: int = 262144;
+pub const MAX_FRAME: int = 262400;
+pub const MAGIC: bytes = b"TAKE";
+
+pub struct Hello {
+    salt: bytes,
+    name: string,
+    size: int,
+    chunk_size: int,
+}
+
+pub fn be64(n: int) -> bytes {
+    bytes_of([
+        (n >> 56) & 255,
+        (n >> 48) & 255,
+        (n >> 40) & 255,
+        (n >> 32) & 255,
+        (n >> 24) & 255,
+        (n >> 16) & 255,
+        (n >> 8) & 255,
+        n & 255
+    ])
+}
+
+pub fn read_be64(b: bytes) -> int {
+    var n = 0;
+    var i = 0;
+    while (i < 8) {
+        n = n * 256 + (b[i] & 255);
+        i = i + 1;
+    }
+    n
+}
+
+fn be32(n: int) -> bytes {
+    bytes_of([(n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255])
+}
+
+fn read_be32(b: bytes) -> int {
+    ((b[0] & 255) << 24) | ((b[1] & 255) << 16) | ((b[2] & 255) << 8) | (b[3] & 255)
+}
+
+fn encode_hello(h: Hello) -> bytes {
+    let name_b = h.name.to_bytes();
+    MAGIC + bytes_of([VERSION]) + h.salt + be32(name_b.len()) + name_b + be64(h.size) + be32(h.chunk_size)
+}
+
+fn decode_hello(payload: bytes) -> Result<Hello, string> {
+    if (payload.len() < 4 + 1 + SALT_LEN + 4 + 8 + 4) {
+        return Result.Err("hello too short");
+    }
+    if (payload.sub_bytes(0, 4) != MAGIC) {
+        return Result.Err("invalid magic");
+    }
+    if ((payload[4] & 255) != VERSION) {
+        return Result.Err("unsupported version");
+    }
+    let salt = payload.sub_bytes(5, 5 + SALT_LEN);
+    var off = 5 + SALT_LEN;
+    let name_len = read_be32(payload.sub_bytes(off, off + 4));
+    off = off + 4;
+    if (name_len < 0 || off + name_len + 8 + 4 > payload.len()) {
+        return Result.Err("invalid name in hello");
+    }
+    let name_b = payload.sub_bytes(off, off + name_len);
+    off = off + name_len;
+    match (from_utf8(name_b)) {
+        Result.Err(_) => Result.Err("name is not utf-8"),
+        Result.Ok(name) => {
+            let size = read_be64(payload.sub_bytes(off, off + 8));
+            off = off + 8;
+            let chunk_size = read_be32(payload.sub_bytes(off, off + 4));
+            Result.Ok(Hello { salt: salt, name: name, size: size, chunk_size: chunk_size })
+        },
+    }
+}
+
+pub fn nonce_for(index: int) -> bytes {
+    be64(index) + b"\x00\x00\x00\x00"
+}
+
+pub fn aad_for(index: int, name: string, size: int) -> bytes {
+    be64(index) + name.to_bytes() + be64(size)
+}
+
+pub fn send_hello(c: framing.Conn, h: Hello) -> Result<framing.Conn, string> {
+    framing.write_frame(c, encode_hello(h))
+}
+
+pub fn recv_hello(c: framing.Conn) -> Result<(framing.Conn, Hello), string> {
+    match (framing.read_frame(c, MAX_FRAME)) {
+        Result.Err(e) => Result.Err(e),
+        Result.Ok(pair) => {
+            let (c2, payload) = pair;
+            match (decode_hello(payload)) {
+                Result.Err(e) => Result.Err(e),
+                Result.Ok(h) => Result.Ok((c2, h)),
+            }
+        },
+    }
+}
+
+/// Sender: sends a nonce and verifies the receiver's HMAC response.
+pub fn auth_as_sender(c: framing.Conn, key: bytes) -> Result<framing.Conn, string> {
+    let nonce = crypto.random_bytes(16);
+    match (framing.write_frame(c, nonce)) {
+        Result.Err(e) => Result.Err(e),
+        Result.Ok(c1) => match (framing.read_frame(c1, 64)) {
+            Result.Err(e) => Result.Err(e),
+            Result.Ok(pair) => {
+                let (c2, resp) = pair;
+                let expect = crypto.hmac_sha256(key, b"auth" + nonce);
+                if (resp != expect) {
+                    Result.Err("authentication failed (wrong password?)")
+                } else {
+                    Result.Ok(c2)
+                }
+            },
+        },
+    }
+}
+
+/// Receiver: reads the nonce and replies with HMAC.
+pub fn auth_as_receiver(c: framing.Conn, key: bytes) -> Result<framing.Conn, string> {
+    match (framing.read_frame(c, 64)) {
+        Result.Err(e) => Result.Err(e),
+        Result.Ok(pair) => {
+            let (c1, nonce) = pair;
+            let mac = crypto.hmac_sha256(key, b"auth" + nonce);
+            framing.write_frame(c1, mac)
+        },
+    }
+}
+
+fn seal(key: bytes, nonce: bytes, aad: bytes, plain: bytes) -> Result<bytes, string> {
+    match (crypto.chacha20poly1305_seal(key, nonce, aad, plain)) {
+        Option.Some(ct) => Result.Ok(ct),
+        Option.None => Result.Err("encryption failed"),
+    }
+}
+
+fn open(key: bytes, nonce: bytes, aad: bytes, ct: bytes) -> Result<bytes, string> {
+    match (crypto.chacha20poly1305_open(key, nonce, aad, ct)) {
+        Option.Some(pt) => Result.Ok(pt),
+        Option.None => Result.Err("decryption failed (tampered data or wrong key)"),
+    }
+}
+
+/// Encrypts and sends a data chunk (`\\x01` + data) or the done frame (`\\x02` + digest).
+pub fn send_chunk(
+    c: framing.Conn,
+    key: bytes,
+    index: int,
+    name: string,
+    size: int,
+    kind: int,
+    body: bytes
+) -> Result<framing.Conn, string> {
+    let plain = bytes_of([kind]) + body;
+    let nonce = nonce_for(index);
+    let aad = aad_for(index, name, size);
+    match (seal(key, nonce, aad, plain)) {
+        Result.Err(e) => Result.Err(e),
+        Result.Ok(ct) => framing.write_frame(c, ct),
+    }
+}
+
+pub struct RecvChunk {
+    conn: framing.Conn,
+    kind: int,
+    body: bytes,
+}
+
+pub fn recv_chunk(
+    c: framing.Conn,
+    key: bytes,
+    index: int,
+    name: string,
+    size: int
+) -> Result<RecvChunk, string> {
+    match (framing.read_frame(c, MAX_FRAME)) {
+        Result.Err(e) => Result.Err(e),
+        Result.Ok(pair) => {
+            let (c2, ct) = pair;
+            let nonce = nonce_for(index);
+            let aad = aad_for(index, name, size);
+            match (open(key, nonce, aad, ct)) {
+                Result.Err(e) => Result.Err(e),
+                Result.Ok(plain) => {
+                    if (plain.len() < 1) {
+                        Result.Err("empty chunk")
+                    } else {
+                        Result.Ok(RecvChunk {
+                            conn: c2,
+                            kind: plain[0] & 255,
+                            body: plain.sub_bytes(1, plain.len()),
+                        })
+                    }
+                },
+            }
+        },
+    }
+}
+
+pub fn derive(password: string, salt: bytes) -> bytes {
+    kdf.derive_key(password, salt)
+}
+
+@test
+fn hello_codec() {
+    let h = Hello {
+        salt: crypto.random_bytes(16),
+        name: "foto.bin",
+        size: 1024,
+        chunk_size: DEFAULT_CHUNK,
+    };
+    match (decode_hello(encode_hello(h))) {
+        Result.Err(e) => panic(e),
+        Result.Ok(h2) => {
+            assert(h2.name == h.name);
+            assert(h2.size == h.size);
+            assert(h2.chunk_size == h.chunk_size);
+            assert(h2.salt == h.salt);
+        },
+    }
+}
+
+@test
+fn be64_roundtrip() {
+    assert(read_be64(be64(0)) == 0);
+    assert(read_be64(be64(255)) == 255);
+    assert(read_be64(be64(1234567890123)) == 1234567890123);
+}

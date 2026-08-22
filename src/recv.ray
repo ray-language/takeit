@@ -1,0 +1,116 @@
+// Modo recv: conecta, autentica y escribe a disco por streaming.
+import std/net;
+import std/fs;
+import framing;
+import protocol;
+import password;
+import kdf;
+import progress;
+import streamhash;
+
+pub struct RecvOpts {
+    host: string,
+    port: int,
+    password: string,
+    out: string,
+    timeout_ms: int,
+}
+
+pub fn run(opts: RecvOpts) -> int {
+    match (net.tcp_connect(opts.host, opts.port)) {
+        Result.Err(e) => {
+            eprint("could not connect: " + e);
+            1
+        },
+        Result.Ok(sock) => {
+            var c0 = framing.from_handle(sock);
+            c0 = framing.set_timeout(c0, opts.timeout_ms);
+            match (protocol.recv_hello(c0)) {
+                Result.Err(e) => { eprint(e); framing.close_conn(c0); 1 },
+                Result.Ok(pair) => {
+                    let (c1, hello) = pair;
+                    let key = kdf.derive_key(password.normalize(opts.password), hello.salt);
+                    match (protocol.auth_as_receiver(c1, key)) {
+                        Result.Err(e) => { eprint(e); framing.close_conn(c1); 1 },
+                        Result.Ok(c2) => {
+                            let out_path = if (opts.out.len() > 0) { opts.out } else { hello.name };
+                            eprint("receiving " + hello.name + " (" + progress.format_bytes(hello.size) + ")");
+                            let code = receive_file(c2, key, hello, out_path);
+                            framing.close_conn(c2);
+                            code
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+fn receive_file(c: framing.Conn, key: bytes, hello: protocol.Hello, out_path: string) -> int {
+    let tmp = out_path + ".takeit.partial";
+    match (fs.write_file_bytes(tmp, b"")) {
+        Result.Err(e) => {
+            eprint(e);
+            return 1;
+        },
+        Result.Ok(_) => { },
+    }
+
+    var conn = c;
+    var index = 0;
+    var written = 0;
+    var hash = streamhash.init();
+    var done = false;
+    var err = "";
+    var meter = progress.start("receiving", hello.size);
+
+    while (!done && err.len() == 0) {
+        match (protocol.recv_chunk(conn, key, index, hello.name, hello.size)) {
+            Result.Err(e) => { err = e; },
+            Result.Ok(ch) => {
+                conn = ch.conn;
+                if (ch.kind == 1) {
+                    match (fs.append_file_bytes(tmp, ch.body)) {
+                        Result.Err(e) => { err = e; },
+                        Result.Ok(_) => {
+                            hash = streamhash.update(hash, ch.body);
+                            written = written + ch.body.len();
+                            index = index + 1;
+                            meter = progress.tick(meter, written);
+                        },
+                    }
+                } else if (ch.kind == 2) {
+                    if (hash != ch.body) {
+                        err = "checksum mismatch";
+                    } else if (written != hello.size) {
+                        err = "unexpected size: " + to_string(written);
+                    } else {
+                        match (fs.rename(tmp, out_path)) {
+                            Result.Err(e) => { err = e; },
+                            Result.Ok(_) => {
+                                match (framing.write_frame(conn, b"OK")) {
+                                    Result.Err(e) => { err = e; },
+                                    Result.Ok(_) => {
+                                        progress.finish(meter);
+                                        print("Saved: " + out_path + " (" + progress.format_bytes(written) + ")");
+                                        done = true;
+                                    },
+                                }
+                            },
+                        }
+                    }
+                } else {
+                    err = "unknown chunk type: " + to_string(ch.kind);
+                }
+            },
+        }
+    }
+
+    if (err.len() > 0) {
+        let _ = fs.remove_file(tmp);
+        eprint("\n" + err);
+        1
+    } else {
+        0
+    }
+}

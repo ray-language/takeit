@@ -1,0 +1,29 @@
+// Hash encadenado apto para streaming (sin cargar el archivo entero).
+// state' = sha256(state ‖ sha256(chunk)); IV fija de 32 bytes.
+import std/crypto;
+
+const IV_SEED: bytes = b"takeit-v1-stream-iv";
+
+/// Initial hash state (32 bytes).
+pub fn init() -> bytes {
+    crypto.sha256(IV_SEED)
+}
+
+/// Folds a plaintext chunk into the running hash.
+pub fn update(state: bytes, chunk: bytes) -> bytes {
+    crypto.sha256(state + crypto.sha256(chunk))
+}
+
+@test
+fn rolling_deterministic() {
+    let a = update(update(init(), b"hola"), b"\x00mundo");
+    let b = update(update(init(), b"hola"), b"\x00mundo");
+    assert(a == b);
+    assert(a.len() == 32);
+    assert(a != update(init(), b"hola\x00mundo"));
+}
+
+@test
+fn empty_is_iv() {
+    assert(init().len() == 32);
+}

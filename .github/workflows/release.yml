@@ -1,0 +1,168 @@
+# takeit RELEASE pipeline. Pushing a `vX.Y.Z` tag builds the native binary for every
+# supported platform and uploads it to that tag's GitHub Release.
+#
+# The raylang toolchain lives in a (private) sibling repo. CI checks it out with
+# RAYLANG_TOKEN and builds `ray` from source; takeit itself has no path deps, so
+# the project only needs `ray` on PATH.
+#
+# Every platform compiles NATIVELY on its own runner. `ray build --release` adds
+# `-C target-cpu=native` unless `--target` is given, which would produce binaries
+# that fault on older CPUs; passing the runner's own triple keeps the release
+# profile (opt3 + fat LTO + codegen-units=1) while staying portable.
+#
+# Assets carry no version in their name (`takeit-<target>.tar.gz`), so install.sh
+# can fetch `releases/latest/download/...` without going through the GitHub API.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # Manual runs build and publish the artifacts to the run itself, without touching
+  # any Release — useful to check the pipeline before cutting a tag.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RAYLANG_REPO: roberto-ayala/raylang
+  RAYLANG_REF: main
+
+jobs:
+  # Create (or reuse, if it already exists) the tag's Release, with generated notes.
+  # A single job so the matrix legs do not race each other creating it.
+  create-release:
+    name: create the tag's Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that the tag matches ray.toml
+        run: |
+          manifest="$(sed -n 's/^version *= *"\(.*\)"/\1/p' ray.toml | head -1)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$manifest" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match ray.toml version $manifest"
+            exit 1
+          fi
+          echo "version $manifest"
+      - name: Create the Release (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" \
+                 --repo "$GITHUB_REPOSITORY" \
+                 --title "takeit $GITHUB_REF_NAME" \
+                 --generate-notes
+
+  build:
+    name: build ${{ matrix.target }}
+    # `always()` keeps the manual (no-tag) run going, where create-release is skipped.
+    needs: create-release
+    if: always() && needs.create-release.result != 'failure'
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-13,         target: x86_64-apple-darwin }
+          - { os: macos-14,         target: aarch64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out takeit
+        uses: actions/checkout@v4
+
+      - name: Check out raylang (toolchain)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.RAYLANG_REPO }}
+          ref: ${{ env.RAYLANG_REF }}
+          token: ${{ secrets.RAYLANG_TOKEN || github.token }}
+          path: raylang
+
+      - name: Install Rust stable + target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Resolve the raylang revision
+        id: raylang
+        shell: bash
+        working-directory: raylang
+        run: echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+
+      # The toolchain build dominates the run; key the cache on the exact raylang
+      # revision so it only rebuilds when raylang actually moves.
+      - name: Cache the raylang toolchain build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            raylang/target
+          key: ray-toolchain-${{ matrix.target }}-${{ steps.raylang.outputs.sha }}
+          restore-keys: ray-toolchain-${{ matrix.target }}-
+
+      - name: Build the ray toolchain
+        shell: bash
+        working-directory: raylang
+        run: |
+          cargo build --release --bin ray
+          echo "$PWD/target/release" >>"$GITHUB_PATH"
+
+      - name: ray version
+        run: ray version
+
+      - name: Run the test suite
+        run: ray test
+
+      # `--target` is the runner's own triple: a native build, but without the
+      # `target-cpu=native` that `--release` alone would bake in.
+      - name: Build the native binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          ray build --native -o dist/takeit --release --target ${{ matrix.target }}
+          ls -la dist/takeit
+
+      - name: Package (tar.gz + sha256)
+        id: package
+        shell: bash
+        run: |
+          asset="takeit-${{ matrix.target }}.tar.gz"
+          tar czf "$asset" -C dist takeit
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" >"$asset.sha256"
+          else
+            shasum -a 256 "$asset" >"$asset.sha256"
+          fi
+          cat "$asset.sha256"
+          echo "asset=$asset" >>"$GITHUB_OUTPUT"
+
+      # Kept for manual runs, and handy for inspecting a tagged build after the fact.
+      - name: Upload the build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: takeit-${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.asset }}.sha256
+
+      - name: Upload the asset to the Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            "${{ steps.package.outputs.asset }}" \
+            "${{ steps.package.outputs.asset }}.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber

@@ -1,0 +1,174 @@
+// Roundtrip localhost con streaming (hash encadenado + append a disco).
+import std/net;
+import std/fs;
+import std/crypto;
+import framing;
+import protocol;
+import password;
+import kdf;
+import streamhash;
+import fileread;
+
+fn basename(path: string) -> string {
+    let parts = path.split("/");
+    if (parts.len() == 0) { return path; }
+    let last = parts[parts.len() - 1];
+    if (last.len() == 0) { path } else { last }
+}
+
+@test
+fn roundtrip_localhost() {
+    let payload = b"hola\x00takeit\xffmundo";
+    let path_in = "/tmp/takeit_roundtrip_in.bin";
+    let path_out = "/tmp/takeit_roundtrip_out.bin";
+    match (fs.write_file_bytes(path_in, payload)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(_) => { },
+    }
+
+    match (net.tcp_listen("127.0.0.1", 0)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(listener) => {
+            let port = net.local_port(listener);
+            let pw = password.generate();
+            let salt = crypto.random_bytes(protocol.SALT_LEN);
+            let key = kdf.derive_key(password.normalize(pw), salt);
+            let name = basename(path_in);
+            let size = payload.len();
+
+            let ready: Channel<int> = Channel.new();
+            let done: Channel<int> = Channel.new();
+
+            spawn(fn() {
+                match (recv(ready)) {
+                    Option.None => panic("ready cerrado"),
+                    Option.Some(_) => { },
+                }
+                match (net.tcp_connect("127.0.0.1", port)) {
+                    Result.Err(e) => panic(e),
+                    Result.Ok(sock) => {
+                        let c0 = framing.from_handle(sock);
+                        match (protocol.recv_hello(c0)) {
+                            Result.Err(e) => panic(e),
+                            Result.Ok(pair) => {
+                                let (c1, hello) = pair;
+                                assert(hello.name == name);
+                                assert(hello.size == size);
+                                let key_r = kdf.derive_key(password.normalize(pw), hello.salt);
+                                match (protocol.auth_as_receiver(c1, key_r)) {
+                                    Result.Err(e) => panic(e),
+                                    Result.Ok(c2) => {
+                                        let tmp = path_out + ".takeit.partial";
+                                        match (fs.write_file_bytes(tmp, b"")) {
+                                            Result.Err(e) => panic(e),
+                                            Result.Ok(_) => { },
+                                        }
+                                        var conn = c2;
+                                        var index = 0;
+                                        var written = 0;
+                                        var hash = streamhash.init();
+                                        var finished = false;
+                                        while (!finished) {
+                                            match (protocol.recv_chunk(conn, key_r, index, hello.name, hello.size)) {
+                                                Result.Err(e) => panic(e),
+                                                Result.Ok(ch) => {
+                                                    conn = ch.conn;
+                                                    if (ch.kind == 1) {
+                                                        match (fs.append_file_bytes(tmp, ch.body)) {
+                                                            Result.Err(e) => panic(e),
+                                                            Result.Ok(_) => {
+                                                                hash = streamhash.update(hash, ch.body);
+                                                                written = written + ch.body.len();
+                                                                index = index + 1;
+                                                            },
+                                                        }
+                                                    } else if (ch.kind == 2) {
+                                                        assert(hash == ch.body);
+                                                        assert(written == size);
+                                                        match (fs.rename(tmp, path_out)) {
+                                                            Result.Err(e) => panic(e),
+                                                            Result.Ok(_) => {
+                                                                match (framing.write_frame(conn, b"OK")) {
+                                                                    Result.Err(e) => panic(e),
+                                                                    Result.Ok(_) => { finished = true; },
+                                                                }
+                                                            },
+                                                        }
+                                                    } else {
+                                                        panic("kind");
+                                                    }
+                                                },
+                                            }
+                                        }
+                                        framing.close_conn(conn);
+                                        send(done, 1);
+                                    },
+                                }
+                            },
+                        }
+                    },
+                }
+            });
+
+            send(ready, 1);
+            match (net.tcp_accept(listener)) {
+                Result.Err(e) => panic(e),
+                Result.Ok(sock) => {
+                    close(listener);
+                    let c0 = framing.from_handle(sock);
+                    let hello = protocol.Hello {
+                        salt: salt,
+                        name: name,
+                        size: size,
+                        chunk_size: 4,
+                    };
+                    match (protocol.send_hello(c0, hello)) {
+                        Result.Err(e) => panic(e),
+                        Result.Ok(c1) => match (protocol.auth_as_sender(c1, key)) {
+                            Result.Err(e) => panic(e),
+                            Result.Ok(c2) => {
+                                var conn = c2;
+                                var index = 0;
+                                var hash = streamhash.init();
+                                match (fileread.for_each_chunk(path_in, 4, fn(piece: bytes) -> Result<int, string> {
+                                    match (protocol.send_chunk(conn, key, index, name, size, 1, piece)) {
+                                        Result.Err(e) => Result.Err(e),
+                                        Result.Ok(c3) => {
+                                            conn = c3;
+                                            hash = streamhash.update(hash, piece);
+                                            index = index + 1;
+                                            Result.Ok(0)
+                                        },
+                                    }
+                                })) {
+                                    Result.Err(e) => panic(e),
+                                    Result.Ok(_) => { },
+                                }
+                                match (protocol.send_chunk(conn, key, index, name, size, 2, hash)) {
+                                    Result.Err(e) => panic(e),
+                                    Result.Ok(c4) => match (framing.read_frame(c4, 16)) {
+                                        Result.Err(e) => panic(e),
+                                        Result.Ok(pair) => {
+                                            let (_c5, ack) = pair;
+                                            assert(ack == b"OK");
+                                            framing.close_conn(c4);
+                                        },
+                                    },
+                                }
+                            },
+                        },
+                    }
+                },
+            }
+
+            match (recv(done)) {
+                Option.Some(_) => { },
+                Option.None => panic("recv no termino"),
+            }
+            match (fs.read_file_bytes(path_out)) {
+                Result.Err(e) => panic(e),
+                Result.Ok(out) => assert(out == payload),
+            }
+        },
+    }
+}

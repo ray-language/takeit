@@ -1,0 +1,26 @@
+// KDF: password + salt → clave ChaCha20-Poly1305 (32 bytes).
+import std/crypto;
+
+const INFO: bytes = b"takeit-v1";
+
+/// `key = hmac_sha256(sha256(password_utf8), salt ‖ "takeit-v1")`.
+pub fn derive_key(password: string, salt: bytes) -> bytes {
+    let pw = crypto.sha256(password.to_bytes());
+    crypto.hmac_sha256(pw, salt + INFO)
+}
+
+@test
+fn derive_is_32_bytes() {
+    let key = derive_key("abcdef0123456789", crypto.random_bytes(16));
+    assert(key.len() == 32);
+}
+
+@test
+fn derive_deterministic() {
+    let salt = b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f";
+    let a = derive_key("secret", salt);
+    let b = derive_key("secret", salt);
+    assert(a == b);
+    let c = derive_key("other", salt);
+    assert(a != c);
+}

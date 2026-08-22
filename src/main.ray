@@ -1,0 +1,112 @@
+// takeit — encrypted end-to-end file transfer.
+import send;
+import recv;
+
+const DEFAULT_TIMEOUT_SECS: int = 120;
+
+fn usage() {
+    eprint("usage:");
+    eprint("  takeit send <file> [--bind HOST] [--port N] [--timeout SECS]");
+    eprint("  takeit recv --host HOST --port N --password PASS [--out PATH] [--timeout SECS]");
+    eprint("");
+    eprint("  --timeout  idle seconds (accept/read); 0 = no limit (default "
+        + to_string(DEFAULT_TIMEOUT_SECS) + ")");
+}
+
+fn flag_value(av: [string], name: string) -> Option<string> {
+    var i = 0;
+    while (i + 1 < av.len()) {
+        if (av[i] == name) {
+            return Option.Some(av[i + 1]);
+        }
+        i = i + 1;
+    }
+    Option.None
+}
+
+fn parse_int_or(s: string, fallback: int) -> int {
+    match (parse_int(s)) {
+        Option.Some(n) => n,
+        Option.None => fallback,
+    }
+}
+
+fn timeout_ms_from_args(av: [string]) -> int {
+    match (flag_value(av, "--timeout")) {
+        Option.Some(s) => {
+            let secs = parse_int_or(s, DEFAULT_TIMEOUT_SECS);
+            if (secs < 0) { 0 } else { secs * 1000 }
+        },
+        Option.None => DEFAULT_TIMEOUT_SECS * 1000,
+    }
+}
+
+fn main() -> int {
+    let av = args();
+    if (av.len() < 1) {
+        usage();
+        return 1;
+    }
+    let cmd = av[0];
+    if (cmd == "send") {
+        if (av.len() < 2) {
+            usage();
+            return 1;
+        }
+        let path = av[1];
+        let bind = match (flag_value(av, "--bind")) {
+            Option.Some(h) => h,
+            Option.None => "0.0.0.0",
+        };
+        let port = match (flag_value(av, "--port")) {
+            Option.Some(p) => parse_int_or(p, 0),
+            Option.None => 0,
+        };
+        send.run(send.SendOpts {
+            path: path,
+            bind: bind,
+            port: port,
+            timeout_ms: timeout_ms_from_args(av),
+        })
+    } else if (cmd == "recv") {
+        let host = match (flag_value(av, "--host")) {
+            Option.Some(h) => h,
+            Option.None => "",
+        };
+        let port_s = match (flag_value(av, "--port")) {
+            Option.Some(p) => p,
+            Option.None => "",
+        };
+        let pw = match (flag_value(av, "--password")) {
+            Option.Some(p) => p,
+            Option.None => "",
+        };
+        let out = match (flag_value(av, "--out")) {
+            Option.Some(o) => o,
+            Option.None => "",
+        };
+        if (host.len() == 0 || port_s.len() == 0 || pw.len() == 0) {
+            usage();
+            return 1;
+        }
+        let port = parse_int_or(port_s, -1);
+        if (port < 0) {
+            eprint("invalid port");
+            return 1;
+        }
+        recv.run(recv.RecvOpts {
+            host: host,
+            port: port,
+            password: pw,
+            out: out,
+            timeout_ms: timeout_ms_from_args(av),
+        })
+    } else if (cmd == "--help" || cmd == "-h" || cmd == "help") {
+        usage();
+        0
+    } else {
+        eprint("unknown command: " + cmd);
+        usage();
+        1
+    }
+}

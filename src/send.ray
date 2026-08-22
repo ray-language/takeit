@@ -1,0 +1,159 @@
+// Modo send: escucha, autentica y envía el archivo cifrado (streaming).
+import std/net;
+import std/fs;
+import std/crypto;
+import std/time;
+import framing;
+import protocol;
+import password;
+import kdf;
+import progress;
+import streamhash;
+import fileread;
+
+pub struct SendOpts {
+    path: string,
+    bind: string,
+    port: int,
+    timeout_ms: int,
+}
+
+fn basename(path: string) -> string {
+    let parts = path.split("/");
+    if (parts.len() == 0) { return path; }
+    let last = parts[parts.len() - 1];
+    if (last.len() == 0) { path } else { last }
+}
+
+pub fn run(opts: SendOpts) -> int {
+    match (fs.file_size(opts.path)) {
+        Result.Err(e) => {
+            eprint("could not read file: " + e);
+            1
+        },
+        Result.Ok(size) => match (net.tcp_listen(opts.bind, opts.port)) {
+            Result.Err(e) => {
+                eprint("could not listen: " + e);
+                1
+            },
+            Result.Ok(listener) => {
+                let port = net.local_port(listener);
+                let pw = password.generate();
+                let salt = crypto.random_bytes(protocol.SALT_LEN);
+                let key = kdf.derive_key(password.normalize(pw), salt);
+                let name = basename(opts.path);
+                print("Password: " + pw);
+                print("Waiting on " + opts.bind + ":" + to_string(port) + " …");
+                print("Receiver should run: takeit recv --host <this-ip> --port " + to_string(port) + " --password " + pw);
+                if (opts.timeout_ms > 0) {
+                    eprint("(idle/accept timeout: " + to_string(opts.timeout_ms / 1000) + "s)");
+                    // accept no honra set_read_timeout; cerramos el listener desde otra fibra.
+                    spawn(fn() {
+                        time.sleep(opts.timeout_ms);
+                        close(listener);
+                    });
+                }
+                match (net.tcp_accept(listener)) {
+                    Result.Err(e) => {
+                        if (e.starts_with("invalid handle") || e == "read timeout") {
+                            eprint("timed out waiting for receiver");
+                        } else {
+                            eprint("accept: " + progress.map_io_err(e));
+                        }
+                        close(listener);
+                        1
+                    },
+                    Result.Ok(sock) => {
+                        close(listener);
+                        var c0 = framing.from_handle(sock);
+                        c0 = framing.set_timeout(c0, opts.timeout_ms);
+                        let hello = protocol.Hello {
+                            salt: salt,
+                            name: name,
+                            size: size,
+                            chunk_size: protocol.DEFAULT_CHUNK,
+                        };
+                        match (protocol.send_hello(c0, hello)) {
+                            Result.Err(e) => { eprint(e); framing.close_conn(c0); 1 },
+                            Result.Ok(c1) => match (protocol.auth_as_sender(c1, key)) {
+                                Result.Err(e) => { eprint(e); framing.close_conn(c1); 1 },
+                                Result.Ok(c2) => {
+                                    let code = stream_file(c2, key, name, size, opts.path);
+                                    framing.close_conn(c2);
+                                    code
+                                },
+                            },
+                        }
+                    },
+                }
+            },
+        },
+    }
+}
+
+fn stream_file(c: framing.Conn, key: bytes, name: string, size: int, path: string) -> int {
+    let chunk = protocol.DEFAULT_CHUNK;
+    var conn = c;
+    var index = 0;
+    var offset = 0;
+    var hash = streamhash.init();
+    var meter = progress.start("sending", size);
+    var send_err = "";
+
+    // Resume: cuando el protocolo aporte el offset ya recibido, usar
+    // fileread.for_each_chunk_from(path, start, chunk, …) en lugar de for_each_chunk.
+    match (fileread.for_each_chunk(path, chunk, fn(piece: bytes) -> Result<int, string> {
+        if (send_err.len() > 0) {
+            return Result.Err(send_err);
+        }
+        match (protocol.send_chunk(conn, key, index, name, size, 1, piece)) {
+            Result.Err(e) => {
+                send_err = e;
+                Result.Err(e)
+            },
+            Result.Ok(c2) => {
+                conn = c2;
+                hash = streamhash.update(hash, piece);
+                index = index + 1;
+                offset = offset + piece.len();
+                meter = progress.tick(meter, offset);
+                Result.Ok(0)
+            },
+        }
+    })) {
+        Result.Err(e) => {
+            eprint("\n" + e);
+            return 1;
+        },
+        Result.Ok(_) => { },
+    }
+
+    if (offset != size) {
+        eprint("\nread size (" + to_string(offset) + ") != expected (" + to_string(size) + ")");
+        return 1;
+    }
+
+    match (protocol.send_chunk(conn, key, index, name, size, 2, hash)) {
+        Result.Err(e) => {
+            eprint("\n" + e);
+            1
+        },
+        Result.Ok(c3) => match (framing.read_frame(c3, 16)) {
+            Result.Err(e) => {
+                eprint("\nwaiting for ACK: " + e);
+                1
+            },
+            Result.Ok(pair) => {
+                let (_c4, ack) = pair;
+                if (ack == b"OK") {
+                    progress.finish(meter);
+                    print("Sent: " + name + " (" + progress.format_bytes(size) + ")");
+                    0
+                } else {
+                    eprint("\nunexpected ACK");
+                    1
+                }
+            },
+        },
+    }
+}
