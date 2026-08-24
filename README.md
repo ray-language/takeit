@@ -2,7 +2,7 @@
 
 Transferencia de archivos **peer-to-peer** con cifrado de extremo a extremo, escrita en [raylang](https://github.com/roberto-ayala/raylang).
 
-Un equipo envía; el otro recibe. No hay cuenta, no hay servidor en la nube, no hay intermediario que vea el archivo: solo TCP, una contraseña de un solo uso y AEAD (ChaCha20-Poly1305).
+**Versión actual: `0.1.0` (protocolo v1).** Un equipo envía un archivo; el otro recibe. No hay cuenta, no hay servidor en la nube, no hay intermediario que vea el contenido: solo TCP, una contraseña de un solo uso y AEAD (ChaCha20-Poly1305).
 
 ```text
 # Emisor
@@ -13,10 +13,32 @@ Receiver should run: takeit recv --host <this-ip> --port 7421 --password 7k9m-qp
 
 # Receptor (otra máquina / otra terminal)
 $ takeit recv --host 203.0.113.10 --port 7421 --password 7k9m-qp2x-lw4n-ab01
-→ Guardado: ./informe.pdf
+Saved: ./informe.pdf (1.2 MiB)
 ```
 
 Comparte la contraseña por un canal aparte (chat, voz, SMS). Quien no la tenga no puede abrir los chunks.
+
+## Estado actual
+
+| Capacidad | Estado |
+|-----------|--------|
+| `send` / `recv` de **un archivo** por sesión | ✅ listo |
+| Cifrado E2E (ChaCha20-Poly1305) + auth por contraseña | ✅ listo |
+| Streaming (chunks 256 KiB, sin cargar el archivo en RAM) | ✅ listo |
+| Hash encadenado de integridad + ACK final | ✅ listo |
+| Barra de progreso en stderr (`sending` / `receiving`) | ✅ listo |
+| Timeouts de idle en accept/lectura (`--timeout`, default 120 s) | ✅ listo |
+| Puerto libre automático (`--port 0` / omitido en send) | ✅ listo |
+| Binarios nativos + `install.sh` + CI de releases | ✅ listo |
+| Tests (`roundtrip_test`, `chunk_review_test`) | ✅ listo |
+| Multi-archivo (protocolo v2) | 📋 diseñado — [`docs/PROTOCOL_V2.md`](docs/PROTOCOL_V2.md) |
+| Reanudación de transferencia a medias | ⏳ API en `fileread`; aún no cableada al protocolo |
+| Relay / códigos cortos / NAT traversal | ⏳ pendiente |
+| TLS en el transporte | ⏳ opcional a futuro |
+
+Alcance de red hoy: **P2P directo**. Emisor y receptor deben poder alcanzarse por TCP (misma LAN, IP pública, o túnel).
+
+Detalle del protocolo y roadmap: [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Por qué takeit
 
@@ -58,6 +80,12 @@ ray build --native -o takeit --release
 install -m 0755 takeit ~/.local/bin/takeit
 ```
 
+Tests:
+
+```sh
+ray test
+```
+
 ## Uso
 
 ```text
@@ -68,13 +96,13 @@ takeit recv --host HOST --port N --password PASS [--out PATH] [--timeout SECS]
 | Flag | Quién | Qué hace |
 |------|-------|----------|
 | `--bind` | send | Dirección de escucha (default `0.0.0.0`) |
-| `--port` | send / recv | Puerto (en send, `0` = el SO elige uno libre) |
+| `--port` | send / recv | Puerto (en send, omitido o `0` = el SO elige uno libre) |
 | `--host` | recv | IP o hostname del emisor |
 | `--password` | recv | Contraseña mostrada por el emisor |
 | `--out` | recv | Ruta de destino (default: nombre del archivo) |
 | `--timeout` | ambos | Segundos de idle en accept/lectura; `0` = sin límite (default `120`) |
 
-Durante la transferencia, stderr muestra progreso (`enviando` / `recibiendo` con %, velocidad y ETA).
+Durante la transferencia, stderr muestra progreso (`sending` / `receiving` con %, velocidad y ETA).
 
 ## Seguridad (resumen)
 
@@ -82,9 +110,22 @@ Durante la transferencia, stderr muestra progreso (`enviando` / `recibiendo` con
 2. Salt de 16 B en el handshake en claro.
 3. KDF: `hmac_sha256(sha256(password), salt ‖ "takeit-v1")` → clave de 32 B.
 4. Chunks AEAD; un fallo de autenticación aborta (contraseña mala o manipulación).
-5. Alcance actual: **P2P directo** (sin relay ni NAT traversal). Ambos peers deben poder alcanzarse por TCP.
+5. Un solo archivo por sesión; magic `TAKE`, versión de protocolo `1`.
 
-Detalle del protocolo y roadmap: [`docs/PLAN.md`](docs/PLAN.md). Diseño multi-archivo (aún no implementado): [`docs/PROTOCOL_V2.md`](docs/PROTOCOL_V2.md).
+## Arquitectura
+
+```text
+src/
+├── main.ray          # CLI: send | recv
+├── password.ray      # generar / normalizar contraseña
+├── kdf.ray           # password + salt → key 32 B
+├── framing.ray       # frames u32 BE + buffer de sobrante
+├── protocol.ray      # hello, auth, chunks AEAD, done
+├── send.ray / recv.ray
+├── progress.ray      # barra de progreso + map de errores I/O
+├── streamhash.ray    # hash encadenado para streaming
+└── fileread.ray      # lectura por trozos (incluye seek para resume futuro)
+```
 
 ## Releases
 
