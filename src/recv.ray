@@ -17,7 +17,14 @@ pub struct RecvOpts {
 }
 
 pub fn run(opts: RecvOpts) -> int {
-    match (net.tcp_connect(opts.host, opts.port)) {
+    // tcp_connect_timeout (raylang M122): a hung or dropping host fails fast instead of
+    // parking the connect forever. Reuse the idle timeout; fall back to 10s when disabled.
+    let connect_ms = if (opts.timeout_ms > 0) { opts.timeout_ms } else { 10000 };
+    match (net.tcp_connect_timeout(
+    opts.host,
+    opts.port,
+    connect_ms
+)) {
         Result.Err(e) => {
             eprint("could not connect: " + e);
             1
@@ -25,16 +32,31 @@ pub fn run(opts: RecvOpts) -> int {
         Result.Ok(sock) => {
             var c0 = framing.from_handle(sock);
             c0 = framing.set_timeout(c0, opts.timeout_ms);
-            match (protocol.recv_hello(c0)) {
-                Result.Err(e) => { eprint(e); framing.close_conn(c0); 1 },
+            match (protocol.recv_hello(
+            c0
+        )) {
+                Result.Err(e) => {
+                    eprint(e);
+                    framing.close_conn(c0);
+                    1
+                },
                 Result.Ok(pair) => {
                     let (c1, hello) = pair;
                     let key = kdf.derive_key(password.normalize(opts.password), hello.salt);
-                    match (protocol.auth_as_receiver(c1, key)) {
-                        Result.Err(e) => { eprint(e); framing.close_conn(c1); 1 },
+                    match (protocol.auth_as_receiver(
+                    c1,
+                    key
+                )) {
+                        Result.Err(e) => {
+                            eprint(e);
+                            framing.close_conn(c1);
+                            1
+                        },
                         Result.Ok(c2) => {
                             let out_path = if (opts.out.len() > 0) { opts.out } else { hello.name };
-                            eprint("receiving " + hello.name + " (" + progress.format_bytes(hello.size) + ")");
+                            eprint(
+                                "receiving " + hello.name + " (" + progress.format_bytes(hello.size) + ")"
+                            );
                             let code = receive_file(c2, key, hello, out_path);
                             framing.close_conn(c2);
                             code
@@ -48,13 +70,17 @@ pub fn run(opts: RecvOpts) -> int {
 
 fn receive_file(c: framing.Conn, key: bytes, hello: protocol.Hello, out_path: string) -> int {
     let tmp = out_path + ".takeit.partial";
-    match (fs.write_file_bytes(tmp, b"")) {
+    // Keep one write handle open for the whole transfer: chunks go straight to it with
+    // fs.write_bytes (raylang M115.1) instead of reopening the file per chunk, and fs.sync
+    // before the rename makes the saved file durable across a power loss, not just a crash.
+    let fh = match (fs.open(tmp, "w")) {
         Result.Err(e) => {
             eprint(e);
             return 1;
         },
-        Result.Ok(_) => { },
-    }
+        Result.Ok(h) => h,
+    };
+    var closed = false;
 
     var conn = c;
     var index = 0;
@@ -65,13 +91,23 @@ fn receive_file(c: framing.Conn, key: bytes, hello: protocol.Hello, out_path: st
     var meter = progress.start("receiving", hello.size);
 
     while (!done && err.len() == 0) {
-        match (protocol.recv_chunk(conn, key, index, hello.name, hello.size)) {
-            Result.Err(e) => { err = e; },
+        match (protocol.recv_chunk(
+        conn,
+        key,
+        index,
+        hello.name,
+        hello.size
+    )) {
+            Result.Err(e) => {
+                err = e;
+            },
             Result.Ok(ch) => {
                 conn = ch.conn;
                 if (ch.kind == 1) {
-                    match (fs.append_file_bytes(tmp, ch.body)) {
-                        Result.Err(e) => { err = e; },
+                    match (fs.write_bytes(fh, ch.body)) {
+                        Result.Err(e) => {
+                            err = e;
+                        },
                         Result.Ok(_) => {
                             hash = streamhash.update(hash, ch.body);
                             written = written + ch.body.len();
@@ -85,15 +121,39 @@ fn receive_file(c: framing.Conn, key: bytes, hello: protocol.Hello, out_path: st
                     } else if (written != hello.size) {
                         err = "unexpected size: " + to_string(written);
                     } else {
-                        match (fs.rename(tmp, out_path)) {
-                            Result.Err(e) => { err = e; },
+                        // Durable then atomic: fsync the bytes, close, then rename into place.
+                        match (fs.sync(
+                fh
+            )) {
+                            Result.Err(e) => {
+                                err = e;
+                            },
                             Result.Ok(_) => {
-                                match (framing.write_frame(conn, b"OK")) {
-                                    Result.Err(e) => { err = e; },
+                                let _ = close(fh);
+                                closed = true;
+                                match (fs.rename(
+                                tmp,
+                                out_path
+                            )) {
+                                    Result.Err(e) => {
+                                        err = e;
+                                    },
                                     Result.Ok(_) => {
-                                        progress.finish(meter);
-                                        print("Saved: " + out_path + " (" + progress.format_bytes(written) + ")");
-                                        done = true;
+                                        match (framing.write_frame(
+                                        conn,
+                                        b"OK"
+                                    )) {
+                                            Result.Err(e) => {
+                                                err = e;
+                                            },
+                                            Result.Ok(_) => {
+                                                progress.finish(meter);
+                                                print(
+                                                    "Saved: " + out_path + " (" + progress.format_bytes(written) + ")"
+                                                );
+                                                done = true;
+                                            },
+                                        }
                                     },
                                 }
                             },
@@ -107,6 +167,9 @@ fn receive_file(c: framing.Conn, key: bytes, hello: protocol.Hello, out_path: st
     }
 
     if (err.len() > 0) {
+        if (!closed) {
+            let _ = close(fh);
+        }
         let _ = fs.remove_file(tmp);
         eprint("\n" + err);
         1
