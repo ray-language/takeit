@@ -1,6 +1,6 @@
 # takeit
 
-Transferencia de archivos **peer-to-peer** con cifrado de extremo a extremo, escrita en [raylang](https://github.com/roberto-ayala/raylang).
+Transferencia de archivos **peer-to-peer** con cifrado de extremo a extremo, escrita en [raylang](https://github.com/ray-language/raylang).
 
 **Versión actual: `0.1.0` (protocolo v2).** Un equipo envía un archivo; el otro recibe. No hay cuenta, no hay servidor en la nube, no hay intermediario que vea el contenido: solo TCP, una contraseña de un solo uso y AEAD (ChaCha20-Poly1305).
 
@@ -51,30 +51,30 @@ Detalle del protocolo y roadmap: [`docs/PLAN.md`](docs/PLAN.md).
 ## Instalación rápida
 
 ```sh
-curl -sSfL https://raw.githubusercontent.com/roberto-ayala/takeit/main/install.sh | sh
+curl -sSfL https://raw.githubusercontent.com/ray-language/takeit/main/install.sh | sh
 ```
 
-El script detecta tu OS/arquitectura, descarga el asset de la [última Release](https://github.com/roberto-ayala/takeit/releases/latest) y lo deja en `~/.local/bin/takeit`.
+El script detecta tu OS/arquitectura, descarga el asset de la [última Release](https://github.com/ray-language/takeit/releases/latest) y lo deja en `~/.local/bin/takeit`.
 
 | Variable | Descripción | Default |
 |----------|-------------|---------|
 | `TAKEIT_VERSION` | Tag concreto (`v0.1.0`) | última release |
 | `TAKEIT_BIN_DIR` | Directorio de instalación | `$HOME/.local/bin` |
-| `TAKEIT_REPO` | `owner/repo` | `roberto-ayala/takeit` |
+| `TAKEIT_REPO` | `owner/repo` | `ray-language/takeit` |
 | `TAKEIT_DRY_RUN` | Solo imprime el plan | (vacío) |
 
 Ejemplo:
 
 ```sh
-TAKEIT_VERSION=v0.1.0 curl -sSfL https://raw.githubusercontent.com/roberto-ayala/takeit/main/install.sh | sh
+TAKEIT_VERSION=v0.1.0 curl -sSfL https://raw.githubusercontent.com/ray-language/takeit/main/install.sh | sh
 ```
 
 ### Compilar desde el fuente
 
-Necesitas el toolchain [raylang](https://github.com/roberto-ayala/raylang) en el `PATH`:
+Necesitas el toolchain [raylang](https://github.com/ray-language/raylang) en el `PATH`:
 
 ```sh
-git clone https://github.com/roberto-ayala/takeit.git
+git clone https://github.com/ray-language/takeit.git
 cd takeit
 ray build --native -o takeit --release
 install -m 0755 takeit ~/.local/bin/takeit

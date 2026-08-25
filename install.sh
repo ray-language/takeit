@@ -2,16 +2,16 @@
 # takeit installer. Downloads the prebuilt binary for this platform from the GitHub
 # Release and installs it into a directory on your PATH.
 #
-#   curl -sSfL https://raw.githubusercontent.com/roberto-ayala/takeit/main/install.sh | sh
+#   curl -sSfL https://raw.githubusercontent.com/ray-language/takeit/main/install.sh | sh
 #
 # Environment variables (all optional):
 #   TAKEIT_VERSION   tag to install (e.g. v0.1.0). Default: the latest release.
 #   TAKEIT_BIN_DIR   install directory. Default: $HOME/.local/bin
-#   TAKEIT_REPO      owner/repo. Default: roberto-ayala/takeit
+#   TAKEIT_REPO      owner/repo. Default: ray-language/takeit
 #   TAKEIT_DRY_RUN   if set, print the plan and download nothing (to test detection).
 set -eu
 
-REPO="${TAKEIT_REPO:-roberto-ayala/takeit}"
+REPO="${TAKEIT_REPO:-ray-language/takeit}"
 BIN_DIR="${TAKEIT_BIN_DIR:-$HOME/.local/bin}"
 
 info() { printf '\033[1;34m→\033[0m %s\n' "$1"; }
