@@ -20,13 +20,17 @@ pub struct SendOpts {
 
 fn basename(path: string) -> string {
     let parts = path.split("/");
-    if (parts.len() == 0) { return path; }
+    if (parts.len() == 0) {
+        return path;
+    }
     let last = parts[parts.len() - 1];
     if (last.len() == 0) { path } else { last }
 }
 
 pub fn run(opts: SendOpts) -> int {
-    match (fs.file_size(opts.path)) {
+    match (fs.file_size(
+    opts.path
+)) {
         Result.Err(e) => {
             eprint("could not read file: " + e);
             1
@@ -44,7 +48,9 @@ pub fn run(opts: SendOpts) -> int {
                 let name = basename(opts.path);
                 print("Password: " + pw);
                 print("Waiting on " + opts.bind + ":" + to_string(port) + " …");
-                print("Receiver should run: takeit recv --host <this-ip> --port " + to_string(port) + " --password " + pw);
+                print(
+                    "Receiver should run: takeit recv --host <this-ip> --port " + to_string(port) + " --password " + pw
+                );
                 if (opts.timeout_ms > 0) {
                     eprint("(idle/accept timeout: " + to_string(opts.timeout_ms / 1000) + "s)");
                     // accept no honra set_read_timeout; cerramos el listener desde otra fibra.
@@ -71,12 +77,20 @@ pub fn run(opts: SendOpts) -> int {
                             salt: salt,
                             name: name,
                             size: size,
-                            chunk_size: protocol.DEFAULT_CHUNK,
+                            chunk_size: protocol.DEFAULT_CHUNK
                         };
                         match (protocol.send_hello(c0, hello)) {
-                            Result.Err(e) => { eprint(e); framing.close_conn(c0); 1 },
+                            Result.Err(e) => {
+                                eprint(e);
+                                framing.close_conn(c0);
+                                1
+                            },
                             Result.Ok(c1) => match (protocol.auth_as_sender(c1, key)) {
-                                Result.Err(e) => { eprint(e); framing.close_conn(c1); 1 },
+                                Result.Err(e) => {
+                                    eprint(e);
+                                    framing.close_conn(c1);
+                                    1
+                                },
                                 Result.Ok(c2) => {
                                     let code = stream_file(c2, key, name, size, opts.path);
                                     framing.close_conn(c2);
@@ -96,7 +110,13 @@ fn stream_file(c: framing.Conn, key: bytes, name: string, size: int, path: strin
     var conn = c;
     var index = 0;
     var offset = 0;
-    var hash = streamhash.init();
+    let hh = match (streamhash.init()) {
+        Result.Err(e) => {
+            eprint("\n" + e);
+            return 1;
+        },
+        Result.Ok(h) => h,
+    };
     var meter = progress.start("sending", size);
     var send_err = "";
 
@@ -113,11 +133,18 @@ fn stream_file(c: framing.Conn, key: bytes, name: string, size: int, path: strin
             },
             Result.Ok(c2) => {
                 conn = c2;
-                hash = streamhash.update(hash, piece);
-                index = index + 1;
-                offset = offset + piece.len();
-                meter = progress.tick(meter, offset);
-                Result.Ok(0)
+                match (streamhash.update(hh, piece)) {
+                    Result.Err(e) => {
+                        send_err = e;
+                        Result.Err(e)
+                    },
+                    Result.Ok(_) => {
+                        index = index + 1;
+                        offset = offset + piece.len();
+                        meter = progress.tick(meter, offset);
+                        Result.Ok(0)
+                    },
+                }
             },
         }
     })) {
@@ -133,7 +160,15 @@ fn stream_file(c: framing.Conn, key: bytes, name: string, size: int, path: strin
         return 1;
     }
 
-    match (protocol.send_chunk(conn, key, index, name, size, 2, hash)) {
+    let digest = match (streamhash.digest(hh)) {
+        Result.Err(e) => {
+            eprint("\n" + e);
+            return 1;
+        },
+        Result.Ok(d) => d,
+    };
+
+    match (protocol.send_chunk(conn, key, index, name, size, 2, digest)) {
         Result.Err(e) => {
             eprint("\n" + e);
             1

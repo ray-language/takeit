@@ -3,6 +3,12 @@
 Diseño de frames para transferir **uno o más archivos** en una sola sesión E2E.
 Complementa `PLAN.md`. **Aún no implementado**; este doc es el contrato antes de codear.
 
+> **Nota (2026-08):** el número `version = 2` YA está en uso: se envió un incremento
+> acotado del protocolo de un archivo que solo cambia el hash de integridad al SHA-256
+> real (hasher incremental de raylang, M126) en lugar del encadenado de v1. Este diseño
+> multi-archivo, cuando se implemente, debe renumerarse a **`version = 3`**.
+
+
 ## Objetivos
 
 - Misma contraseña y un solo `host:port` (o relay futuro) para N archivos.
@@ -21,7 +27,7 @@ Complementa `PLAN.md`. **Aún no implementado**; este doc es el contrato antes d
 | Error en un archivo | **Abortar la sesión** entera (parciales se borran) |
 | Rutas | Relativas POSIX (`dir/a.txt`); rechazar `..`, absolutas y `\` |
 | Destino receptor | Directorio (`--out DIR`); si es un solo archivo, se permite fichero como hoy |
-| Hash por archivo | Igual que v1: encadenado `sha256(state ‖ sha256(chunk))` |
+| Hash por archivo | SHA-256 real del plaintext (hasher incremental M126) |
 | Contador AEAD | Un solo contador monótono de frames cifrados en toda la sesión |
 | KDF | Sin cambio: `hmac_sha256(sha256(password), salt ‖ "takeit-v1")` |
 
@@ -166,7 +172,7 @@ bytes chunk           // 1 .. chunk_size (último puede ser menor; size 0 solo s
 ```text
 u8    0x12
 u32   file_index
-bytes digest          // 32 B streamhash del plaintext de ese archivo
+bytes digest          // 32 B: SHA-256 (incremental, M126) del plaintext de ese archivo
 ```
 
 Tras verificar digest y tamaño, el receptor hace rename atómico del `.takeit.partial` al path final.
@@ -176,7 +182,7 @@ Tras verificar digest y tamaño, el receptor hace rename atómico del `.takeit.p
 ```text
 u8    0x13
 u32   file_count      // eco del Hello (sanity check)
-bytes session_digest  // 32 B: streamhash sobre la concatenación de digests de cada FileDone
+bytes session_digest  // 32 B: SHA-256 (incremental) sobre la concatenación de digests de cada FileDone
                       //   h = init()
                       //   for d in file_digests: h = update(h, d)
 ```

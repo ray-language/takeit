@@ -2,7 +2,7 @@
 
 Transferencia de archivos **peer-to-peer** con cifrado de extremo a extremo, escrita en [raylang](https://github.com/roberto-ayala/raylang).
 
-**Versión actual: `0.1.0` (protocolo v1).** Un equipo envía un archivo; el otro recibe. No hay cuenta, no hay servidor en la nube, no hay intermediario que vea el contenido: solo TCP, una contraseña de un solo uso y AEAD (ChaCha20-Poly1305).
+**Versión actual: `0.1.0` (protocolo v2).** Un equipo envía un archivo; el otro recibe. No hay cuenta, no hay servidor en la nube, no hay intermediario que vea el contenido: solo TCP, una contraseña de un solo uso y AEAD (ChaCha20-Poly1305).
 
 ```text
 # Emisor
@@ -25,7 +25,7 @@ Comparte la contraseña por un canal aparte (chat, voz, SMS). Quien no la tenga 
 | `send` / `recv` de **un archivo** por sesión | ✅ listo |
 | Cifrado E2E (ChaCha20-Poly1305) + auth por contraseña | ✅ listo |
 | Streaming (chunks 256 KiB, sin cargar el archivo en RAM) | ✅ listo |
-| Hash encadenado de integridad + ACK final | ✅ listo |
+| Hash de integridad SHA-256 (incremental, M126) + ACK final | ✅ listo |
 | Barra de progreso en stderr (`sending` / `receiving`) | ✅ listo |
 | Timeouts de idle en accept/lectura (`--timeout`, default 120 s) | ✅ listo |
 | Puerto libre automático (`--port 0` / omitido en send) | ✅ listo |
@@ -43,7 +43,7 @@ Detalle del protocolo y roadmap: [`docs/PLAN.md`](docs/PLAN.md).
 ## Por qué takeit
 
 - **E2E de verdad** — la clave se deriva de la contraseña + un salt público; el contenido viaja cifrado con ChaCha20-Poly1305.
-- **Streaming** — el archivo no se carga entero en RAM; se lee y escribe por trozos (256 KiB) con hash encadenado de integridad.
+- **Streaming** — el archivo no se carga entero en RAM; se lee y escribe por trozos (256 KiB) con hash de integridad SHA-256 (incremental).
 - **UX mínima** — genera la contraseña, escucha, muestra el comando exacto del receptor y una barra de progreso en stderr.
 - **Un solo binario** — sin runtime, sin deps externas; compilado a código nativo con `ray build --native`.
 - **Escrito en Raylang** — crypto, red y CLI sobre la stdlib del lenguaje.
@@ -110,7 +110,7 @@ Durante la transferencia, stderr muestra progreso (`sending` / `receiving` con %
 2. Salt de 16 B en el handshake en claro.
 3. KDF: `hmac_sha256(sha256(password), salt ‖ "takeit-v1")` → clave de 32 B.
 4. Chunks AEAD; un fallo de autenticación aborta (contraseña mala o manipulación).
-5. Un solo archivo por sesión; magic `TAKE`, versión de protocolo `1`.
+5. Un solo archivo por sesión; magic `TAKE`, versión de protocolo `2`. El hash de integridad es el SHA-256 real del texto plano (hasher incremental de raylang, M126).
 
 ## Arquitectura
 
@@ -123,7 +123,7 @@ src/
 ├── protocol.ray      # hello, auth, chunks AEAD, done
 ├── send.ray / recv.ray
 ├── progress.ray      # barra de progreso + map de errores I/O
-├── streamhash.ray    # hash encadenado para streaming
+├── streamhash.ray    # SHA-256 incremental para streaming (M126)
 └── fileread.ray      # lectura por trozos (incluye seek para resume futuro)
 ```
 

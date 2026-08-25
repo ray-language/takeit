@@ -82,10 +82,19 @@ fn receive_file(c: framing.Conn, key: bytes, hello: protocol.Hello, out_path: st
     };
     var closed = false;
 
+    let hh = match (streamhash.init()) {
+        Result.Err(e) => {
+            let _ = close(fh);
+            let _ = fs.remove_file(tmp);
+            eprint(e);
+            return 1;
+        },
+        Result.Ok(h) => h,
+    };
+
     var conn = c;
     var index = 0;
     var written = 0;
-    var hash = streamhash.init();
     var done = false;
     var err = "";
     var meter = progress.start("receiving", hello.size);
@@ -109,55 +118,70 @@ fn receive_file(c: framing.Conn, key: bytes, hello: protocol.Hello, out_path: st
                             err = e;
                         },
                         Result.Ok(_) => {
-                            hash = streamhash.update(hash, ch.body);
-                            written = written + ch.body.len();
-                            index = index + 1;
-                            meter = progress.tick(meter, written);
+                            match (streamhash.update(hh, ch.body)) {
+                                Result.Err(e) => {
+                                    err = e;
+                                },
+                                Result.Ok(_) => {
+                                    written = written + ch.body.len();
+                                    index = index + 1;
+                                    meter = progress.tick(meter, written);
+                                },
+                            }
                         },
                     }
                 } else if (ch.kind == 2) {
-                    if (hash != ch.body) {
-                        err = "checksum mismatch";
-                    } else if (written != hello.size) {
-                        err = "unexpected size: " + to_string(written);
-                    } else {
-                        // Durable then atomic: fsync the bytes, close, then rename into place.
-                        match (fs.sync(
-                fh
+                    match (streamhash.digest(
+                hh
             )) {
-                            Result.Err(e) => {
-                                err = e;
-                            },
-                            Result.Ok(_) => {
-                                let _ = close(fh);
-                                closed = true;
-                                match (fs.rename(
-                                tmp,
-                                out_path
-                            )) {
+                        Result.Err(e) => {
+                            err = e;
+                        },
+                        Result.Ok(digest) => {
+                            if (digest != ch.body) {
+                                err = "checksum mismatch";
+                            } else if (written != hello.size) {
+                                err = "unexpected size: " + to_string(written);
+                            } else {
+                                // Durable then atomic: fsync the bytes, close, then rename into place.
+                                match (fs.sync(
+                            fh
+                        )) {
                                     Result.Err(e) => {
                                         err = e;
                                     },
                                     Result.Ok(_) => {
-                                        match (framing.write_frame(
-                                        conn,
-                                        b"OK"
+                                        let _ = close(fh);
+                                        closed = true;
+                                        match (fs.rename(
+                                        tmp,
+                                        out_path
                                     )) {
                                             Result.Err(e) => {
                                                 err = e;
                                             },
                                             Result.Ok(_) => {
-                                                progress.finish(meter);
-                                                print(
-                                                    "Saved: " + out_path + " (" + progress.format_bytes(written) + ")"
-                                                );
-                                                done = true;
+                                                match (framing.write_frame(
+                                                conn,
+                                                b"OK"
+                                            )) {
+                                                    Result.Err(e) => {
+                                                        err = e;
+                                                    },
+                                                    Result.Ok(_) => {
+                                                        progress.finish(meter);
+                                                        print(
+                                                            "Saved: " + out_path + " (" + progress.format_bytes(written) + ")"
+                                                        );
+                                                        done = true;
+                                                    },
+                                                }
                                             },
                                         }
                                     },
                                 }
-                            },
-                        }
+                            }
+                        },
                     }
                 } else {
                     err = "unknown chunk type: " + to_string(ch.kind);

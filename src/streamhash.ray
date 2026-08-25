@@ -1,29 +1,70 @@
-// Hash encadenado apto para streaming (sin cargar el archivo entero).
-// state' = sha256(state ‖ sha256(chunk)); IV fija de 32 bytes.
+// Integridad por streaming con el hasher incremental de raylang (M126).
+// v2: el hash es el SHA-256 REAL de todo el texto plano, independiente de cómo se
+// trocee — a diferencia del encadenado de v1 (sha256(state ‖ sha256(chunk))), que
+// dependía de las fronteras de los trozos. El handle es mutable: `update` lo alimenta
+// en orden y `digest` lo cierra devolviendo los 32 bytes.
 import std/crypto;
 
-const IV_SEED: bytes = b"takeit-v1-stream-iv";
-
-/// Initial hash state (32 bytes).
-pub fn init() -> bytes {
-    crypto.sha256(IV_SEED)
+/// Opens a fresh incremental SHA-256 hasher.
+pub fn init() -> Result<int, string> {
+    crypto.sha256_init()
 }
 
-/// Folds a plaintext chunk into the running hash.
-pub fn update(state: bytes, chunk: bytes) -> bytes {
-    crypto.sha256(state + crypto.sha256(chunk))
+/// Feeds one plaintext chunk into the running hash, in order.
+pub fn update(h: int, chunk: bytes) -> Result<int, string> {
+    crypto.hash_update(h, chunk)
 }
 
-@test
-fn rolling_deterministic() {
-    let a = update(update(init(), b"hola"), b"\x00mundo");
-    let b = update(update(init(), b"hola"), b"\x00mundo");
-    assert(a == b);
-    assert(a.len() == 32);
-    assert(a != update(init(), b"hola\x00mundo"));
+/// Finalizes the hasher and returns the 32-byte digest.
+pub fn digest(h: int) -> Result<bytes, string> {
+    crypto.hash_final(h)
 }
 
 @test
-fn empty_is_iv() {
-    assert(init().len() == 32);
+fn incremental_equals_full_sha256() {
+    match (init()) {
+        Result.Err(_) => assert(false),
+        Result.Ok(h) => {
+            let _ = update(h, b"hola");
+            let _ = update(h, b"\x00mundo");
+            match (digest(h)) {
+                Result.Err(_) => assert(false),
+                Result.Ok(d) => {
+                    assert(d == crypto.sha256(b"hola\x00mundo"));
+                    assert(d.len() == 32);
+                },
+            }
+        },
+    }
+}
+
+@test
+fn boundaries_do_not_matter() {
+    var a = b"";
+    match (init()) {
+        Result.Err(_) => assert(false),
+        Result.Ok(h) => {
+            let _ = update(h, b"abcdef");
+            match (digest(h)) {
+                Result.Err(_) => assert(false),
+                Result.Ok(d) => {
+                    a = d;
+                },
+            }
+        },
+    }
+    match (init()) {
+        Result.Err(_) => assert(false),
+        Result.Ok(h) => {
+            let _ = update(h, b"abc");
+            let _ = update(h, b"def");
+            match (digest(h)) {
+                Result.Err(_) => assert(false),
+                Result.Ok(d) => {
+                    assert(d == a);
+                    assert(d == crypto.sha256(b"abcdef"));
+                },
+            }
+        },
+    }
 }
