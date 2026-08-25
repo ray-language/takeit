@@ -106,7 +106,7 @@ La lectura ya soporta reanudación: `fileread.for_each_chunk_from(path, start, c
 | 5 | progreso, timeouts | ✅ |
 | 6 | relay / códigos cortos (opcional) | pendiente |
 | 7 | `ray build --native -o takeit --release` | pendiente |
-| 8 | multi-archivo (protocolo v2) | documentado → [`PROTOCOL_V2.md`](PROTOCOL_V2.md) |
+| 8 | multi-archivo (protocolo v3) | documentado → [`PROTOCOL_V3.md`](PROTOCOL_V3.md) |
 | 9 | resume de transferencia | pendiente (API en `fileread`; ver arriba) |
 
 ## Flujo
