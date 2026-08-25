@@ -31,7 +31,7 @@ Comparte la contraseña por un canal aparte (chat, voz, SMS). Quien no la tenga 
 | Puerto libre automático (`--port 0` / omitido en send) | ✅ listo |
 | Binarios nativos + `install.sh` + CI de releases | ✅ listo |
 | Tests (`roundtrip_test`, `chunk_review_test`) | ✅ listo |
-| Multi-archivo (protocolo v2) | 📋 diseñado — [`docs/PROTOCOL_V2.md`](docs/PROTOCOL_V2.md) |
+| Multi-archivo (protocolo v3) | 📋 diseñado — [`docs/PROTOCOL_V3.md`](docs/PROTOCOL_V3.md) |
 | Reanudación de transferencia a medias | ⏳ API en `fileread`; aún no cableada al protocolo |
 | Relay / códigos cortos / NAT traversal | ⏳ pendiente |
 | TLS en el transporte | ⏳ opcional a futuro |
