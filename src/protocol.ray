@@ -1,13 +1,20 @@
-// Protocolo takeit v1: hello, auth, chunks AEAD, done.
+// Protocolo takeit v2: hello, auth, chunks AEAD, done.
+// v2 (raylang M126): el hash de integridad es el SHA-256 real del texto plano
+// (hasher incremental), no el encadenado dependiente de fronteras de v1. Wire
+// incompatible: un peer v1 y uno v2 se rechazan en el hello.
 import std/crypto;
 import framing;
 import kdf;
 
-pub const VERSION: int = 1;
+pub const VERSION: int = 2;
+
 pub const SALT_LEN: int = 16;
+
 /// 256 KiB: fewer AEAD frames and better throughput on large files.
 pub const DEFAULT_CHUNK: int = 262144;
+
 pub const MAX_FRAME: int = 262400;
+
 pub const MAGIC: bytes = b"TAKE";
 
 pub struct Hello {
@@ -18,16 +25,18 @@ pub struct Hello {
 }
 
 pub fn be64(n: int) -> bytes {
-    bytes_of([
-        (n >> 56) & 255,
-        (n >> 48) & 255,
-        (n >> 40) & 255,
-        (n >> 32) & 255,
-        (n >> 24) & 255,
-        (n >> 16) & 255,
-        (n >> 8) & 255,
-        n & 255
-    ])
+    bytes_of(
+        [
+            n >> 56 & 255,
+            n >> 48 & 255,
+            n >> 40 & 255,
+            n >> 32 & 255,
+            n >> 24 & 255,
+            n >> 16 & 255,
+            n >> 8 & 255,
+            n & 255
+        ]
+    )
 }
 
 pub fn read_be64(b: bytes) -> int {
@@ -41,16 +50,18 @@ pub fn read_be64(b: bytes) -> int {
 }
 
 fn be32(n: int) -> bytes {
-    bytes_of([(n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255])
+    bytes_of([n >> 24 & 255, n >> 16 & 255, n >> 8 & 255, n & 255])
 }
 
 fn read_be32(b: bytes) -> int {
-    ((b[0] & 255) << 24) | ((b[1] & 255) << 16) | ((b[2] & 255) << 8) | (b[3] & 255)
+    (b[0] & 255) << 24 | (b[1] & 255) << 16 | (b[2] & 255) << 8 | b[3] & 255
 }
 
 fn encode_hello(h: Hello) -> bytes {
     let name_b = h.name.to_bytes();
-    MAGIC + bytes_of([VERSION]) + h.salt + be32(name_b.len()) + name_b + be64(h.size) + be32(h.chunk_size)
+    MAGIC + bytes_of(
+        [VERSION]
+    ) + h.salt + be32(name_b.len()) + name_b + be64(h.size) + be32(h.chunk_size)
 }
 
 fn decode_hello(payload: bytes) -> Result<Hello, string> {
@@ -198,11 +209,13 @@ pub fn recv_chunk(
                     if (plain.len() < 1) {
                         Result.Err("empty chunk")
                     } else {
-                        Result.Ok(RecvChunk {
-                            conn: c2,
-                            kind: plain[0] & 255,
-                            body: plain.sub_bytes(1, plain.len()),
-                        })
+                        Result.Ok(
+                            RecvChunk {
+                                conn: c2,
+                                kind: plain[0] & 255,
+                                body: plain.sub_bytes(1, plain.len())
+                            }
+                        )
                     }
                 },
             }
@@ -220,7 +233,7 @@ fn hello_codec() {
         salt: crypto.random_bytes(16),
         name: "foto.bin",
         size: 1024,
-        chunk_size: DEFAULT_CHUNK,
+        chunk_size: DEFAULT_CHUNK
     };
     match (decode_hello(encode_hello(h))) {
         Result.Err(e) => panic(e),

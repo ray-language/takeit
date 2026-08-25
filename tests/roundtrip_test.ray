@@ -1,4 +1,4 @@
-// Roundtrip localhost con streaming (hash encadenado + append a disco).
+// Roundtrip localhost con streaming (SHA-256 incremental M126 + escritura a disco).
 import std/net;
 import std/fs;
 import std/crypto;
@@ -11,7 +11,9 @@ import fileread;
 
 fn basename(path: string) -> string {
     let parts = path.split("/");
-    if (parts.len() == 0) { return path; }
+    if (parts.len() == 0) {
+        return path;
+    }
     let last = parts[parts.len() - 1];
     if (last.len() == 0) { path } else { last }
 }
@@ -26,7 +28,10 @@ fn roundtrip_localhost() {
         Result.Ok(_) => { },
     }
 
-    match (net.tcp_listen("127.0.0.1", 0)) {
+    match (net.tcp_listen(
+    "127.0.0.1",
+    0
+)) {
         Result.Err(e) => panic(e),
         Result.Ok(listener) => {
             let port = net.local_port(listener);
@@ -66,10 +71,19 @@ fn roundtrip_localhost() {
                                         var conn = c2;
                                         var index = 0;
                                         var written = 0;
-                                        var hash = streamhash.init();
+                                        let hh = match (streamhash.init()) {
+                                            Result.Err(e) => panic(e),
+                                            Result.Ok(h) => h,
+                                        };
                                         var finished = false;
                                         while (!finished) {
-                                            match (protocol.recv_chunk(conn, key_r, index, hello.name, hello.size)) {
+                                            match (protocol.recv_chunk(
+                                            conn,
+                                            key_r,
+                                            index,
+                                            hello.name,
+                                            hello.size
+                                        )) {
                                                 Result.Err(e) => panic(e),
                                                 Result.Ok(ch) => {
                                                     conn = ch.conn;
@@ -77,20 +91,34 @@ fn roundtrip_localhost() {
                                                         match (fs.append_file_bytes(tmp, ch.body)) {
                                                             Result.Err(e) => panic(e),
                                                             Result.Ok(_) => {
-                                                                hash = streamhash.update(hash, ch.body);
+                                                                match (streamhash.update(
+                                                                    hh,
+                                                                    ch.body
+                                                                )) {
+                                                                    Result.Err(e) => panic(e),
+                                                                    Result.Ok(_) => { },
+                                                                }
                                                                 written = written + ch.body.len();
                                                                 index = index + 1;
                                                             },
                                                         }
                                                     } else if (ch.kind == 2) {
-                                                        assert(hash == ch.body);
+                                                        match (streamhash.digest(hh)) {
+                                                            Result.Err(e) => panic(e),
+                                                            Result.Ok(d) => assert(d == ch.body),
+                                                        }
                                                         assert(written == size);
                                                         match (fs.rename(tmp, path_out)) {
                                                             Result.Err(e) => panic(e),
                                                             Result.Ok(_) => {
-                                                                match (framing.write_frame(conn, b"OK")) {
+                                                                match (framing.write_frame(
+                                                                conn,
+                                                                b"OK"
+                                                            )) {
                                                                     Result.Err(e) => panic(e),
-                                                                    Result.Ok(_) => { finished = true; },
+                                                                    Result.Ok(_) => {
+                                                                        finished = true;
+                                                                    },
                                                                 }
                                                             },
                                                         }
@@ -111,7 +139,9 @@ fn roundtrip_localhost() {
             });
 
             send(ready, 1);
-            match (net.tcp_accept(listener)) {
+            match (net.tcp_accept(
+                listener
+            )) {
                 Result.Err(e) => panic(e),
                 Result.Ok(sock) => {
                     close(listener);
@@ -120,22 +150,39 @@ fn roundtrip_localhost() {
                         salt: salt,
                         name: name,
                         size: size,
-                        chunk_size: 4,
+                        chunk_size: 4
                     };
-                    match (protocol.send_hello(c0, hello)) {
+                    match (protocol.send_hello(
+                    c0,
+                    hello
+                )) {
                         Result.Err(e) => panic(e),
                         Result.Ok(c1) => match (protocol.auth_as_sender(c1, key)) {
                             Result.Err(e) => panic(e),
                             Result.Ok(c2) => {
                                 var conn = c2;
                                 var index = 0;
-                                var hash = streamhash.init();
+                                let hh = match (streamhash.init()) {
+                                    Result.Err(e) => panic(e),
+                                    Result.Ok(h) => h,
+                                };
                                 match (fileread.for_each_chunk(path_in, 4, fn(piece: bytes) -> Result<int, string> {
-                                    match (protocol.send_chunk(conn, key, index, name, size, 1, piece)) {
+                                    match (protocol.send_chunk(
+                                    conn,
+                                    key,
+                                    index,
+                                    name,
+                                    size,
+                                    1,
+                                    piece
+                                )) {
                                         Result.Err(e) => Result.Err(e),
                                         Result.Ok(c3) => {
                                             conn = c3;
-                                            hash = streamhash.update(hash, piece);
+                                            match (streamhash.update(hh, piece)) {
+                                                Result.Err(e) => panic(e),
+                                                Result.Ok(_) => { },
+                                            }
                                             index = index + 1;
                                             Result.Ok(0)
                                         },
@@ -144,7 +191,19 @@ fn roundtrip_localhost() {
                                     Result.Err(e) => panic(e),
                                     Result.Ok(_) => { },
                                 }
-                                match (protocol.send_chunk(conn, key, index, name, size, 2, hash)) {
+                                let digest = match (streamhash.digest(hh)) {
+                                    Result.Err(e) => panic(e),
+                                    Result.Ok(d) => d,
+                                };
+                                match (protocol.send_chunk(
+                                conn,
+                                key,
+                                index,
+                                name,
+                                size,
+                                2,
+                                digest
+                            )) {
                                     Result.Err(e) => panic(e),
                                     Result.Ok(c4) => match (framing.read_frame(c4, 16)) {
                                         Result.Err(e) => panic(e),
