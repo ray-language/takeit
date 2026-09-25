@@ -21,8 +21,12 @@ fn basename(path: string) -> string {
 @test
 fn roundtrip_localhost() {
     let payload = b"hola\x00takeit\xffmundo";
-    let path_in = "/tmp/takeit_roundtrip_in.bin";
-    let path_out = "/tmp/takeit_roundtrip_out.bin";
+    let dir = match (fs.make_temp_dir("takeit_roundtrip_")) {
+        Result.Ok(d) => d,
+        Result.Err(e) => panic(e),
+    };
+    let path_in = dir + "/in.bin";
+    let path_out = dir + "/out.bin";
     match (fs.write_file_bytes(path_in, payload)) {
         Result.Err(e) => panic(e),
         Result.Ok(_) => { },
@@ -72,8 +76,7 @@ fn roundtrip_localhost() {
                                             Result.Err(e) => panic(e),
                                             Result.Ok(h) => h,
                                         };
-                                        var finished = false;
-                                        while (!finished) {
+                                        while (true) {
                                             match (protocol.recv_chunk(
                                                 conn,
                                                 key_r,
@@ -114,7 +117,7 @@ fn roundtrip_localhost() {
                                                                 )) {
                                                                     Result.Err(e) => panic(e),
                                                                     Result.Ok(_) => {
-                                                                        finished = true;
+                                                                        break;
                                                                     },
                                                                 }
                                                             },
@@ -220,6 +223,7 @@ fn roundtrip_localhost() {
                 Result.Err(e) => panic(e),
                 Result.Ok(out) => assert(out == payload),
             }
+            let _ = fs.remove_all(dir);
         },
     }
 }

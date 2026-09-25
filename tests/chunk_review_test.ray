@@ -3,15 +3,23 @@
 import fileread;
 import std/fs;
 
+/// A fresh private temp dir (fs.make_temp_dir); each test removes it with fs.remove_all.
+fn temp_dir() -> string {
+    match (fs.make_temp_dir("takeit_chunk_")) {
+        Result.Ok(d) => d,
+        Result.Err(e) => panic(e),
+    }
+}
+
 fn write_sample(path: string, size: int) {
-    var data = b"";
+    var octets: [int] = [];
     var i = 0;
     // Contenido no uniforme: si un trozo se repitiera o se saltara, se notaría.
     while (i < size) {
-        data = data + bytes_of([65 + (i - (i / 26) * 26)]);
+        octets.push(65 + i % 26);
         i = i + 1;
     }
-    match (fs.write_file_bytes(path, data)) {
+    match (fs.write_file_bytes(path, bytes_of(octets))) {
         Result.Ok(_) => { },
         Result.Err(e) => panic(e),
     }
@@ -19,7 +27,8 @@ fn write_sample(path: string, size: int) {
 
 @test
 fn chunks_are_exact_and_cover_the_file() {
-    let path = "/tmp/takeit_chunk_a.bin";
+    let dir = temp_dir();
+    let path = dir + "/sample.bin";
     // 1000 octetos con trozos de 64: 15 llenos y una cola de 40.
     write_sample(path, 1000);
     var sizes: [int] = [];
@@ -45,12 +54,13 @@ fn chunks_are_exact_and_cover_the_file() {
         Result.Ok(original) => assert(joined == original),
         Result.Err(e) => panic(e),
     }
-    let _ = fs.remove_file(path);
+    let _ = fs.remove_all(dir);
 }
 
 @test
 fn resuming_reads_only_the_tail() {
-    let path = "/tmp/takeit_chunk_b.bin";
+    let dir = temp_dir();
+    let path = dir + "/sample.bin";
     write_sample(path, 300);
     var joined = b"";
     match (fileread.for_each_chunk_from(path, 250, 64, fn(piece: bytes) -> Result<int, string> {
@@ -65,12 +75,13 @@ fn resuming_reads_only_the_tail() {
         Result.Ok(original) => assert(joined == original.sub_bytes(250, 300)),
         Result.Err(e) => panic(e),
     }
-    let _ = fs.remove_file(path);
+    let _ = fs.remove_all(dir);
 }
 
 @test
 fn the_edges_behave() {
-    let path = "/tmp/takeit_chunk_c.bin";
+    let dir = temp_dir();
+    let path = dir + "/sample.bin";
     // Archivo vacío: ni un solo trozo.
     write_sample(path, 0);
     var count = 0;
@@ -98,16 +109,18 @@ fn the_edges_behave() {
         Result.Err(_) => { },
     }
     // Un archivo que no existe: error del open, no un éxito vacío.
-    match (fileread.for_each_chunk("/tmp/takeit_no_existe.bin", 8, fn(p: bytes) -> Result<int, string> { Result.Ok(0) })) {
+    match (fileread.for_each_chunk(dir
+        + "/missing.bin", 8, fn(p: bytes) -> Result<int, string> { Result.Ok(0) })) {
         Result.Ok(_) => panic("un archivo inexistente debería fallar"),
         Result.Err(_) => { },
     }
-    let _ = fs.remove_file(path);
+    let _ = fs.remove_all(dir);
 }
 
 @test
 fn a_failing_receiver_stops_the_read() {
-    let path = "/tmp/takeit_chunk_d.bin";
+    let dir = temp_dir();
+    let path = dir + "/sample.bin";
     write_sample(path, 1000);
     var seen = 0;
     match (fileread.for_each_chunk(path, 64, fn(piece: bytes) -> Result<int, string> {
@@ -119,12 +132,13 @@ fn a_failing_receiver_stops_the_read() {
     }
     // Y no se sigue leyendo tras el fallo.
     assert_eq(seen, 3);
-    let _ = fs.remove_file(path);
+    let _ = fs.remove_all(dir);
 }
 
 @test
 fn starting_past_the_end_is_not_a_silent_success() {
-    let path = "/tmp/takeit_chunk_e.bin";
+    let dir = temp_dir();
+    let path = dir + "/sample.bin";
     write_sample(path, 100);
     var count = 0;
     let outcome = fileread.for_each_chunk_from(path, 500, 16, fn(p: bytes) -> Result<int, string> {
@@ -137,12 +151,13 @@ fn starting_past_the_end_is_not_a_silent_success() {
         Result.Ok(_) => panic("un offset pasado del final debería fallar"),
         Result.Err(_) => { },
     }
-    let _ = fs.remove_file(path);
+    let _ = fs.remove_all(dir);
 }
 
 @test
 fn the_total_is_what_the_caller_would_have_counted() {
-    let path = "/tmp/takeit_chunk_f.bin";
+    let dir = temp_dir();
+    let path = dir + "/sample.bin";
     write_sample(path, 700);
     match (fileread.for_each_chunk(path, 128, fn(p: bytes) -> Result<int, string> { Result.Ok(0) })) {
         Result.Err(e) => panic(e),
@@ -157,5 +172,5 @@ fn the_total_is_what_the_caller_would_have_counted() {
         Result.Err(e) => panic(e),
         Result.Ok(total) => assert_eq(total, 200),
     }
-    let _ = fs.remove_file(path);
+    let _ = fs.remove_all(dir);
 }
