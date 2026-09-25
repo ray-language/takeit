@@ -9,8 +9,11 @@ fn usage() {
     eprint("  takeit send <file> [--bind HOST] [--port N] [--timeout SECS]");
     eprint("  takeit recv --host HOST --port N --password PASS [--out PATH] [--timeout SECS]");
     eprint("");
-    eprint("  --timeout  idle seconds (accept/read); 0 = no limit (default "
-        + to_string(DEFAULT_TIMEOUT_SECS) + ")");
+    eprint(
+        "  --timeout  idle seconds (accept/read); 0 = no limit (default "
+            + to_string(DEFAULT_TIMEOUT_SECS)
+            + ")"
+    );
 }
 
 fn flag_value(av: [string], name: string) -> Option<string> {
@@ -62,12 +65,14 @@ fn main() -> int {
             Option.Some(p) => parse_int_or(p, 0),
             Option.None => 0,
         };
-        send.run(send.SendOpts {
-            path: path,
-            bind: bind,
-            port: port,
-            timeout_ms: timeout_ms_from_args(av),
-        })
+        send.run(
+            send.SendOpts {
+                path: path,
+                bind: bind,
+                port: port,
+                timeout_ms: timeout_ms_from_args(av)
+            }
+        )
     } else if (cmd == "recv") {
         let host = match (flag_value(av, "--host")) {
             Option.Some(h) => h,
@@ -94,13 +99,15 @@ fn main() -> int {
             eprint("invalid port");
             return 1;
         }
-        recv.run(recv.RecvOpts {
-            host: host,
-            port: port,
-            password: pw,
-            out: out,
-            timeout_ms: timeout_ms_from_args(av),
-        })
+        recv.run(
+            recv.RecvOpts {
+                host: host,
+                port: port,
+                password: pw,
+                out: out,
+                timeout_ms: timeout_ms_from_args(av)
+            }
+        )
     } else if (cmd == "--help" || cmd == "-h" || cmd == "help") {
         usage();
         0

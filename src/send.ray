@@ -28,9 +28,7 @@ fn basename(path: string) -> string {
 }
 
 pub fn run(opts: SendOpts) -> int {
-    match (fs.file_size(
-    opts.path
-)) {
+    match (fs.file_size(opts.path)) {
         Result.Err(e) => {
             eprint("could not read file: " + e);
             1
@@ -49,7 +47,10 @@ pub fn run(opts: SendOpts) -> int {
                 print("Password: " + pw);
                 print("Waiting on " + opts.bind + ":" + to_string(port) + " …");
                 print(
-                    "Receiver should run: takeit recv --host <this-ip> --port " + to_string(port) + " --password " + pw
+                    "Receiver should run: takeit recv --host <this-ip> --port "
+                        + to_string(port)
+                        + " --password "
+                        + pw
                 );
                 if (opts.timeout_ms > 0) {
                     eprint("(idle/accept timeout: " + to_string(opts.timeout_ms / 1000) + "s)");

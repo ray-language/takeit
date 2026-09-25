@@ -13,13 +13,7 @@ pub struct Meter {
 
 pub fn start(label: string, total: int) -> Meter {
     let now = time.monotonic();
-    Meter {
-        total: total,
-        done: 0,
-        started_ms: now,
-        last_print_ms: 0,
-        label: label,
-    }
+    Meter { total: total, done: 0, started_ms: now, last_print_ms: 0, label: label }
 }
 
 /// Compact size format: `11 B`, `1.5 KiB`, `5.5 MiB`, …
@@ -40,18 +34,26 @@ pub fn format_bytes(n: int) -> string {
 }
 
 fn pct(done: int, total: int) -> int {
-    if (total <= 0) { return 100; }
-    if (done >= total) { return 100; }
+    if (total <= 0) {
+        return 100;
+    }
+    if (done >= total) {
+        return 100;
+    }
     done * 100 / total
 }
 
 fn rate_bps(done: int, elapsed_ms: int) -> int {
-    if (elapsed_ms <= 0) { return 0; }
+    if (elapsed_ms <= 0) {
+        return 0;
+    }
     done * 1000 / elapsed_ms
 }
 
 fn eta_ms(done: int, total: int, elapsed_ms: int) -> int {
-    if (done <= 0 || elapsed_ms <= 0 || done >= total) { return 0; }
+    if (done <= 0 || elapsed_ms <= 0 || done >= total) {
+        return 0;
+    }
     let rem = total - done;
     rem * elapsed_ms / done
 }
@@ -98,7 +100,7 @@ pub fn finish(m: Meter) {
         done: m.total,
         started_ms: m.started_ms,
         last_print_ms: m.last_print_ms,
-        label: m.label,
+        label: m.label
     };
     match (io.ewrite(render_line(final_m) + "\n")) {
         Result.Ok(_) => { },
