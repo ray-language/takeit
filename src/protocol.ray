@@ -59,9 +59,13 @@ fn read_be32(b: bytes) -> int {
 
 fn encode_hello(h: Hello) -> bytes {
     let name_b = h.name.to_bytes();
-    MAGIC + bytes_of(
-        [VERSION]
-    ) + h.salt + be32(name_b.len()) + name_b + be64(h.size) + be32(h.chunk_size)
+    MAGIC
+        + bytes_of([VERSION])
+        + h.salt
+        + be32(name_b.len())
+        + name_b
+        + be64(h.size)
+        + be32(h.chunk_size)
 }
 
 fn decode_hello(payload: bytes) -> Result<Hello, string> {

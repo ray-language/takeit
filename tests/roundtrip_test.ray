@@ -28,10 +28,7 @@ fn roundtrip_localhost() {
         Result.Ok(_) => { },
     }
 
-    match (net.tcp_listen(
-    "127.0.0.1",
-    0
-)) {
+    match (net.tcp_listen("127.0.0.1", 0)) {
         Result.Err(e) => panic(e),
         Result.Ok(listener) => {
             let port = net.local_port(listener);
@@ -78,12 +75,12 @@ fn roundtrip_localhost() {
                                         var finished = false;
                                         while (!finished) {
                                             match (protocol.recv_chunk(
-                                            conn,
-                                            key_r,
-                                            index,
-                                            hello.name,
-                                            hello.size
-                                        )) {
+                                                conn,
+                                                key_r,
+                                                index,
+                                                hello.name,
+                                                hello.size
+                                            )) {
                                                 Result.Err(e) => panic(e),
                                                 Result.Ok(ch) => {
                                                     conn = ch.conn;
@@ -112,9 +109,9 @@ fn roundtrip_localhost() {
                                                             Result.Err(e) => panic(e),
                                                             Result.Ok(_) => {
                                                                 match (framing.write_frame(
-                                                                conn,
-                                                                b"OK"
-                                                            )) {
+                                                                    conn,
+                                                                    b"OK"
+                                                                )) {
                                                                     Result.Err(e) => panic(e),
                                                                     Result.Ok(_) => {
                                                                         finished = true;
@@ -139,9 +136,7 @@ fn roundtrip_localhost() {
             });
 
             send(ready, 1);
-            match (net.tcp_accept(
-                listener
-            )) {
+            match (net.tcp_accept(listener)) {
                 Result.Err(e) => panic(e),
                 Result.Ok(sock) => {
                     close(listener);
@@ -152,10 +147,7 @@ fn roundtrip_localhost() {
                         size: size,
                         chunk_size: 4
                     };
-                    match (protocol.send_hello(
-                    c0,
-                    hello
-                )) {
+                    match (protocol.send_hello(c0, hello)) {
                         Result.Err(e) => panic(e),
                         Result.Ok(c1) => match (protocol.auth_as_sender(c1, key)) {
                             Result.Err(e) => panic(e),
@@ -168,14 +160,14 @@ fn roundtrip_localhost() {
                                 };
                                 match (fileread.for_each_chunk(path_in, 4, fn(piece: bytes) -> Result<int, string> {
                                     match (protocol.send_chunk(
-                                    conn,
-                                    key,
-                                    index,
-                                    name,
-                                    size,
-                                    1,
-                                    piece
-                                )) {
+                                        conn,
+                                        key,
+                                        index,
+                                        name,
+                                        size,
+                                        1,
+                                        piece
+                                    )) {
                                         Result.Err(e) => Result.Err(e),
                                         Result.Ok(c3) => {
                                             conn = c3;
@@ -196,14 +188,14 @@ fn roundtrip_localhost() {
                                     Result.Ok(d) => d,
                                 };
                                 match (protocol.send_chunk(
-                                conn,
-                                key,
-                                index,
-                                name,
-                                size,
-                                2,
-                                digest
-                            )) {
+                                    conn,
+                                    key,
+                                    index,
+                                    name,
+                                    size,
+                                    2,
+                                    digest
+                                )) {
                                     Result.Err(e) => panic(e),
                                     Result.Ok(c4) => match (framing.read_frame(c4, 16)) {
                                         Result.Err(e) => panic(e),

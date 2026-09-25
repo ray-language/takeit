@@ -43,7 +43,9 @@ pub fn read_exact(c: Conn, n: int) -> Result<(Conn, bytes), string> {
                     conn = Conn { handle: conn.handle, buf: conn.buf + chunk };
                 }
             },
-            Result.Err(e) => { err = progress.map_io_err(e); },
+            Result.Err(e) => {
+                err = progress.map_io_err(e);
+            },
         }
     }
     if (err.len() > 0) {
