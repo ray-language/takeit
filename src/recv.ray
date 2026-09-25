@@ -90,11 +90,10 @@ fn receive_file(c: framing.Conn, key: bytes, hello: protocol.Hello, out_path: st
     var conn = c;
     var index = 0;
     var written = 0;
-    var done = false;
     var err = "";
     var meter = progress.start("receiving", hello.size);
 
-    while (!done && err.len() == 0) {
+    while (err.len() == 0) {
         match (protocol.recv_chunk(conn, key, index, hello.name, hello.size)) {
             Result.Err(e) => {
                 err = e;
@@ -156,7 +155,7 @@ fn receive_file(c: framing.Conn, key: bytes, hello: protocol.Hello, out_path: st
                                                                 + progress.format_bytes(written)
                                                                 + ")"
                                                         );
-                                                        done = true;
+                                                        break;
                                                     },
                                                 }
                                             },

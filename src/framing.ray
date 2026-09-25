@@ -33,28 +33,22 @@ fn read_be32(b: bytes) -> int {
 /// Reads exactly `n` octets (accumulates socket reads).
 pub fn read_exact(c: Conn, n: int) -> Result<(Conn, bytes), string> {
     var conn = c;
-    var err = "";
-    while (err.len() == 0 && conn.buf.len() < n) {
+    while (conn.buf.len() < n) {
         match (net.socket_read_bytes(conn.handle)) {
             Result.Ok(chunk) => {
                 if (chunk.len() == 0) {
-                    err = "connection closed before read completed";
-                } else {
-                    conn = Conn { handle: conn.handle, buf: conn.buf + chunk };
+                    return Result.Err("connection closed before read completed");
                 }
+                conn = Conn { handle: conn.handle, buf: conn.buf + chunk };
             },
             Result.Err(e) => {
-                err = progress.map_io_err(e);
+                return Result.Err(progress.map_io_err(e));
             },
         }
     }
-    if (err.len() > 0) {
-        Result.Err(err)
-    } else {
-        let out = conn.buf.sub_bytes(0, n);
-        let rest = conn.buf.sub_bytes(n, conn.buf.len());
-        Result.Ok((Conn { handle: conn.handle, buf: rest }, out))
-    }
+    let out = conn.buf.sub_bytes(0, n);
+    let rest = conn.buf.sub_bytes(n, conn.buf.len());
+    Result.Ok((Conn { handle: conn.handle, buf: rest }, out))
 }
 
 pub fn write_all(c: Conn, data: bytes) -> Result<Conn, string> {

@@ -55,21 +55,18 @@ pub fn for_each_chunk_from(
                     Result.Ok(_) => { },
                 }
             }
-            var go = err.len() == 0;
-            while (go) {
+            while (err.len() == 0) {
                 match (fs.read_bytes(h, chunk_size)) {
                     Result.Err(e) => {
                         err = e;
-                        go = false;
                     },
                     Result.Ok(opt) => match (opt) {
                         Option.None => {
-                            go = false;
+                            break;
                         },
                         Option.Some(piece) => match (on_chunk(piece)) {
                             Result.Err(e) => {
                                 err = e;
-                                go = false;
                             },
                             Result.Ok(_) => {
                                 total = total + piece.len();
