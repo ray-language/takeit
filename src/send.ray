@@ -2,7 +2,6 @@
 import std/net;
 import std/fs;
 import std/crypto;
-import std/time;
 import framing;
 import protocol;
 import password;
@@ -54,15 +53,11 @@ pub fn run(opts: SendOpts) -> int {
                 );
                 if (opts.timeout_ms > 0) {
                     eprint("(idle/accept timeout: " + to_string(opts.timeout_ms / 1000) + "s)");
-                    // accept no honra set_read_timeout; cerramos el listener desde otra fibra.
-                    spawn(fn() {
-                        time.sleep(opts.timeout_ms);
-                        close(listener);
-                    });
+                    net.set_read_timeout(listener, opts.timeout_ms);
                 }
                 match (net.tcp_accept(listener)) {
                     Result.Err(e) => {
-                        if (e.starts_with("invalid handle") || e == "read timeout") {
+                        if (e == "read timeout") {
                             eprint("timed out waiting for receiver");
                         } else {
                             eprint("accept: " + progress.map_io_err(e));
