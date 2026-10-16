@@ -7,13 +7,16 @@ const DEFAULT_TIMEOUT_SECS: int = 120;
 fn usage() {
     eprint("usage:");
     eprint("  takeit send <file> [--bind HOST] [--port N] [--timeout SECS]");
-    eprint("  takeit recv --host HOST --port N --password PASS [--out PATH] [--timeout SECS]");
+    eprint(
+        "  takeit recv --host HOST --port N --password PASS [--out PATH] [--timeout SECS] [--fresh]"
+    );
     eprint("");
     eprint(
         "  --timeout  idle seconds (accept/read); 0 = no limit (default "
             + to_string(DEFAULT_TIMEOUT_SECS)
             + ")"
     );
+    eprint("  --fresh    recv: ignore a partial file from an interrupted transfer (no resume)");
 }
 
 fn flag_value(av: [string], name: string) -> Option<string> {
@@ -105,7 +108,8 @@ fn main() -> int {
                 port: port,
                 password: pw,
                 out: out,
-                timeout_ms: timeout_ms_from_args(av)
+                timeout_ms: timeout_ms_from_args(av),
+                resume: !av.contains("--fresh")
             }
         )
     } else if (cmd == "--help" || cmd == "-h" || cmd == "help") {

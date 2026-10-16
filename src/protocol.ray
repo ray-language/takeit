@@ -1,12 +1,15 @@
-// Protocolo takeit v2: hello, auth, chunks AEAD, done.
+// Protocolo takeit v3: hello, auth, resume/start, chunks AEAD, done.
 // v2 (raylang M126): el hash de integridad es el SHA-256 real del texto plano
-// (hasher incremental), no el encadenado dependiente de fronteras de v1. Wire
-// incompatible: un peer v1 y uno v2 se rechazan en el hello.
+// (hasher incremental), no el encadenado dependiente de fronteras de v1.
+// v3: reanudación. Tras el auth, el receptor declara cuántos bytes ya tiene (y el
+// SHA-256 de ese prefijo); el emisor responde desde qué offset envía. El receptor
+// también cifra, así que cada dirección tiene su propio espacio de nonces. Wire
+// incompatible: peers de versiones distintas se rechazan en el hello.
 import std/crypto;
 import framing;
 import kdf;
 
-pub const VERSION: int = 2;
+pub const VERSION: int = 3;
 
 pub const SALT_LEN: int = 16;
 
@@ -16,6 +19,23 @@ pub const DEFAULT_CHUNK: int = 262144;
 pub const MAX_FRAME: int = 262400;
 
 pub const MAGIC: bytes = b"TAKE";
+
+/// Sealed frame kinds (first plaintext byte).
+pub const KIND_DATA: int = 1;
+
+pub const KIND_DONE: int = 2;
+
+/// Receiver → sender, its first sealed frame: bytes already held + SHA-256 of them.
+pub const KIND_RESUME: int = 3;
+
+/// Sender → receiver, its first sealed frame: the offset the data starts at.
+pub const KIND_START: int = 4;
+
+/// Nonce direction tags. Both peers seal with the same key, so each direction owns a
+/// disjoint nonce space: a receiver frame never reuses a sender nonce.
+pub const FROM_SENDER: int = 0;
+
+pub const FROM_RECEIVER: int = 1;
 
 pub struct Hello {
     salt: bytes,
@@ -98,8 +118,8 @@ fn decode_hello(payload: bytes) -> Result<Hello, string> {
     }
 }
 
-pub fn nonce_for(index: int) -> bytes {
-    be64(index) + b"\x00\x00\x00\x00"
+pub fn nonce_for(index: int, dir: int) -> bytes {
+    be64(index) + be32(dir)
 }
 
 pub fn aad_for(index: int, name: string, size: int) -> bytes {
@@ -169,7 +189,7 @@ fn open(key: bytes, nonce: bytes, aad: bytes, ct: bytes) -> Result<bytes, string
     }
 }
 
-/// Encrypts and sends a data chunk (`\\x01` + data) or the done frame (`\\x02` + digest).
+/// Encrypts and sends a sender frame: data (`KIND_DATA` + bytes), start or done.
 pub fn send_chunk(
     c: framing.Conn,
     key: bytes,
@@ -179,8 +199,22 @@ pub fn send_chunk(
     kind: int,
     body: bytes
 ) -> Result<framing.Conn, string> {
+    send_sealed(c, key, FROM_SENDER, index, name, size, kind, body)
+}
+
+/// Encrypts `kind` + `body` with the nonce of (`dir`, `index`) and sends it as one frame.
+pub fn send_sealed(
+    c: framing.Conn,
+    key: bytes,
+    dir: int,
+    index: int,
+    name: string,
+    size: int,
+    kind: int,
+    body: bytes
+) -> Result<framing.Conn, string> {
     let plain = bytes_of([kind]) + body;
-    let nonce = nonce_for(index);
+    let nonce = nonce_for(index, dir);
     let aad = aad_for(index, name, size);
     match (seal(key, nonce, aad, plain)) {
         Result.Err(e) => Result.Err(e),
@@ -194,9 +228,22 @@ pub struct RecvChunk {
     body: bytes,
 }
 
+/// Reads and opens a sender frame.
 pub fn recv_chunk(
     c: framing.Conn,
     key: bytes,
+    index: int,
+    name: string,
+    size: int
+) -> Result<RecvChunk, string> {
+    recv_sealed(c, key, FROM_SENDER, index, name, size)
+}
+
+/// Reads one frame and opens it with the nonce of (`dir`, `index`).
+pub fn recv_sealed(
+    c: framing.Conn,
+    key: bytes,
+    dir: int,
     index: int,
     name: string,
     size: int
@@ -205,7 +252,7 @@ pub fn recv_chunk(
         Result.Err(e) => Result.Err(e),
         Result.Ok(pair) => {
             let (c2, ct) = pair;
-            let nonce = nonce_for(index);
+            let nonce = nonce_for(index, dir);
             let aad = aad_for(index, name, size);
             match (open(key, nonce, aad, ct)) {
                 Result.Err(e) => Result.Err(e),
@@ -225,6 +272,38 @@ pub fn recv_chunk(
             }
         },
     }
+}
+
+/// What the receiver already holds: `offset` bytes whose SHA-256 is `prefix_digest`.
+pub struct Resume {
+    offset: int,
+    prefix_digest: bytes,
+}
+
+pub fn encode_resume(r: Resume) -> bytes {
+    be64(r.offset) + r.prefix_digest
+}
+
+pub fn decode_resume(body: bytes) -> Result<Resume, string> {
+    if (body.len() != 8 + 32) {
+        return Result.Err("invalid resume frame");
+    }
+    let offset = read_be64(body.sub_bytes(0, 8));
+    if (offset < 0) {
+        return Result.Err("invalid resume offset");
+    }
+    Result.Ok(Resume { offset: offset, prefix_digest: body.sub_bytes(8, 40) })
+}
+
+pub fn decode_start(body: bytes) -> Result<int, string> {
+    if (body.len() != 8) {
+        return Result.Err("invalid start frame");
+    }
+    let offset = read_be64(body);
+    if (offset < 0) {
+        return Result.Err("invalid start offset");
+    }
+    Result.Ok(offset)
 }
 
 pub fn derive(password: string, salt: bytes) -> bytes {
@@ -255,4 +334,28 @@ fn be64_roundtrip() {
     assert(read_be64(be64(0)) == 0);
     assert(read_be64(be64(255)) == 255);
     assert(read_be64(be64(1234567890123)) == 1234567890123);
+}
+
+@test
+fn resume_codec() {
+    let digest = crypto.sha256(b"prefix");
+    match (decode_resume(encode_resume(Resume { offset: 1234567, prefix_digest: digest }))) {
+        Result.Err(e) => panic(e),
+        Result.Ok(r) => {
+            assert_eq(r.offset, 1234567);
+            assert(r.prefix_digest == digest);
+        },
+    }
+    assert(decode_resume(b"short").is_err());
+    match (decode_start(be64(42))) {
+        Result.Err(e) => panic(e),
+        Result.Ok(n) => assert_eq(n, 42),
+    }
+    assert(decode_start(b"").is_err());
+}
+
+@test
+fn directions_never_share_a_nonce() {
+    assert(nonce_for(0, FROM_SENDER) != nonce_for(0, FROM_RECEIVER));
+    assert_eq(nonce_for(7, FROM_RECEIVER).len(), 12);
 }

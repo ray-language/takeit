@@ -1,12 +1,16 @@
-# Protocolo takeit v3 — varios archivos
+# Protocolo takeit v4 — varios archivos
 
 Diseño de frames para transferir **uno o más archivos** en una sola sesión E2E.
 Complementa `PLAN.md`. **Aún no implementado**; este doc es el contrato antes de codear.
 
 > **Nota (2026-08):** `version = 2` ya está tomada por un incremento acotado del
 > protocolo de un archivo, que solo cambió el hash de integridad al SHA-256 real
-> (hasher incremental de raylang, M126) en lugar del encadenado de v1. Por eso este
-> diseño multi-archivo usa **`version = 3`**.
+> (hasher incremental de raylang, M126) en lugar del encadenado de v1.
+>
+> **Nota (2026-10):** `version = 3` la tomó la **reanudación** del protocolo de un
+> archivo (frames `Resume`/`Start` tras el auth y nonces separados por dirección; ver
+> `PLAN.md` § Reanudación). Por eso este diseño multi-archivo usa **`version = 4`**, y
+> debe conservar esos dos frames y el tag de dirección del nonce.
 
 
 ## Objetivos
@@ -14,11 +18,11 @@ Complementa `PLAN.md`. **Aún no implementado**; este doc es el contrato antes d
 - Misma contraseña y un solo `host:port` (o relay futuro) para N archivos.
 - Streaming por archivo (sin cargar todo en RAM).
 - Progreso global + archivo actual.
-- Compatibilidad: un peer v1/v2 solo habla su propia versión; este diseño usa `version = 3`.
+- Compatibilidad: un peer v1/v2/v3 solo habla su propia versión; este diseño usa `version = 4`.
 
 ## Decisiones
 
-| Tema | Elección v3 |
+| Tema | Elección v4 |
 |------|-------------|
 | Unidad de sesión | Una conexión = un lote de archivos |
 | Manifiesto | Tras auth, **cifrado** (nombres no van en claro en la red) |
@@ -73,7 +77,7 @@ Tras el auth, **todo** el payload útil viaja dentro de AEAD. El plaintext de ca
 | `0x01` | Data | Trozo de plaintext del archivo actual |
 | `0x12` | FileDone | Tras el último Data del archivo |
 | `0x13` | SessionDone | Tras el último FileDone |
-| `0x02` | Done (legacy v1/v2) | No se usa en v3 |
+| `0x02` | Done (legacy v1/v2) | No se usa en v4 |
 
 Los frames **en claro** (antes/durante auth) no usan `kind` AEAD:
 
@@ -82,7 +86,7 @@ Los frames **en claro** (antes/durante auth) no usan `kind` AEAD:
 | Hello | ver abajo |
 | Auth challenge | 16 B nonce |
 | Auth response | 32 B HMAC |
-| SessionACK | literal `OK` (o futuro `ERR` + motivo) — **en claro** tras SessionDone, o cifrado; v3: **en claro** `OK` como v1/v2 |
+| SessionACK | literal `OK` (o futuro `ERR` + motivo) — **en claro** tras SessionDone, o cifrado; v4: **en claro** `OK` como v1/v2 |
 
 ## Hello (claro)
 
@@ -199,7 +203,7 @@ Si falla auth, AEAD, path inválido, checksum o I/O:
 2. Cierra el socket.
 3. Emisor reporta error al fallar write/read o al no recibir ACK.
 
-No hay reanudación (resume) en v3.
+No hay reanudación (resume) en v4.
 
 ## UX CLI (propuesta)
 
@@ -228,13 +232,13 @@ takeit recv --host H --port P --password X --out ./inbox
 | Peer A | Peer B | Resultado |
 |--------|--------|-----------|
 | v1 o v2 | igual | Sin cambio (protocolos ya enviados: v1 encadenado, v2 SHA-256 de un archivo) |
-| v3 | v3 | Este documento |
-| v3 send | v1/v2 recv | el receptor ve `version=3` → error "unsupported version" |
-| v1/v2 send | v3 recv | v3 puede **aceptar el hello legacy** (camino de un archivo) o rechazar; **recomendación**: v3 recv acepta v2 |
+| v4 | v4 | Este documento |
+| v4 send | v1/v2 recv | el receptor ve `version=3` → error "unsupported version" |
+| v1/v2 send | v4 recv | v4 puede **aceptar el hello legacy** (camino de un archivo) o rechazar; **recomendación**: v4 recv acepta v2 |
 
 Implementación sugerida: `protocol.ray` con `VERSION = 3` y rama para el hello legacy de un archivo en el receptor.
 
-## Fuera de alcance v3
+## Fuera de alcance v4
 
 - Relay / códigos cortos (fase 6 del plan).
 - Compresión, delta, resume.
@@ -243,7 +247,7 @@ Implementación sugerida: `protocol.ray` con `VERSION = 3` y rama para el hello 
 
 ## Checklist de implementación
 
-- [ ] Codificar/decodificar Hello v3 + Manifest
+- [ ] Codificar/decodificar Hello v4 + Manifest
 - [ ] Validación de paths
 - [ ] Bucle FileBegin → Data* → FileDone
 - [ ] SessionDone + session_digest

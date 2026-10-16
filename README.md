@@ -2,7 +2,7 @@
 
 Transferencia de archivos **peer-to-peer** con cifrado de extremo a extremo, escrita en [raylang](https://github.com/ray-language/raylang).
 
-**Versión actual: `0.1.0` (protocolo v2).** Un equipo envía un archivo; el otro recibe. No hay cuenta, no hay servidor en la nube, no hay intermediario que vea el contenido: solo TCP, una contraseña de un solo uso y AEAD (ChaCha20-Poly1305).
+**Versión actual: `0.2.0` (protocolo v3).** Un equipo envía un archivo; el otro recibe. No hay cuenta, no hay servidor en la nube, no hay intermediario que vea el contenido: solo TCP, una contraseña de un solo uso y AEAD (ChaCha20-Poly1305).
 
 ```text
 # Emisor
@@ -31,8 +31,8 @@ Comparte la contraseña por un canal aparte (chat, voz, SMS). Quien no la tenga 
 | Puerto libre automático (`--port 0` / omitido en send) | ✅ listo |
 | Binarios nativos + `install.sh` + CI de releases | ✅ listo |
 | Tests (`roundtrip_test`, `chunk_review_test`) | ✅ listo |
-| Multi-archivo (protocolo v3) | 📋 diseñado — [`docs/PROTOCOL_V3.md`](docs/PROTOCOL_V3.md) |
-| Reanudación de transferencia a medias | ⏳ API en `fileread`; aún no cableada al protocolo |
+| Multi-archivo (protocolo v4) | 📋 diseñado — [`docs/PROTOCOL_V4.md`](docs/PROTOCOL_V4.md) |
+| Reanudación de una transferencia cortada (solo se envía lo que falta) | ✅ listo |
 | Relay / códigos cortos / NAT traversal | ⏳ pendiente |
 | TLS en el transporte | ⏳ opcional a futuro |
 
@@ -90,7 +90,7 @@ ray test
 
 ```text
 takeit send <file> [--bind HOST] [--port N] [--timeout SECS]
-takeit recv --host HOST --port N --password PASS [--out PATH] [--timeout SECS]
+takeit recv --host HOST --port N --password PASS [--out PATH] [--timeout SECS] [--fresh]
 ```
 
 | Flag | Quién | Qué hace |
@@ -101,8 +101,22 @@ takeit recv --host HOST --port N --password PASS [--out PATH] [--timeout SECS]
 | `--password` | recv | Contraseña mostrada por el emisor |
 | `--out` | recv | Ruta de destino (default: nombre del archivo) |
 | `--timeout` | ambos | Segundos de idle en accept/lectura; `0` = sin límite (default `120`) |
+| `--fresh` | recv | Ignora un parcial de una transferencia cortada y empieza de cero |
 
 Durante la transferencia, stderr muestra progreso (`sending` / `receiving` con %, velocidad y ETA).
+
+### Reanudar
+
+Si la transferencia se corta, el receptor conserva `<archivo>.takeit.partial`. Basta con
+volver a enviar el mismo archivo (`takeit send`, contraseña nueva) y repetir `takeit recv` con
+el mismo `--out`: el emisor comprueba que el parcial es un prefijo de su archivo (SHA-256) y
+envía solo lo que falta. Si no lo es, empieza de cero solo.
+
+```text
+$ takeit recv --host 203.0.113.10 --port 7421 --password …
+resuming at 88.7 MiB
+Saved: ./informe.pdf (300.0 MiB, resumed at 88.7 MiB)
+```
 
 ## Seguridad (resumen)
 
@@ -110,7 +124,8 @@ Durante la transferencia, stderr muestra progreso (`sending` / `receiving` con %
 2. Salt de 16 B en el handshake en claro.
 3. KDF: `hmac_sha256(sha256(password), salt ‖ "takeit-v1")` → clave de 32 B.
 4. Chunks AEAD; un fallo de autenticación aborta (contraseña mala o manipulación).
-5. Un solo archivo por sesión; magic `TAKE`, versión de protocolo `2`. El hash de integridad es el SHA-256 real del texto plano (hasher incremental de raylang, M126).
+5. Un solo archivo por sesión; magic `TAKE`, versión de protocolo `3`. El hash de integridad es el SHA-256 real del archivo completo (hasher incremental de raylang, M126), también al reanudar.
+6. Emisor y receptor cifran con la misma clave, cada uno en su propio espacio de nonces (tag de dirección).
 
 ## Arquitectura
 
@@ -120,11 +135,11 @@ src/
 ├── password.ray      # generar / normalizar contraseña
 ├── kdf.ray           # password + salt → key 32 B
 ├── framing.ray       # frames u32 BE + buffer de sobrante
-├── protocol.ray      # hello, auth, chunks AEAD, done
+├── protocol.ray      # hello, auth, resume/start, chunks AEAD, done
 ├── send.ray / recv.ray
 ├── progress.ray      # barra de progreso + map de errores I/O
-├── streamhash.ray    # SHA-256 incremental para streaming (M126)
-└── fileread.ray      # lectura por trozos (incluye seek para resume futuro)
+├── streamhash.ray    # SHA-256 incremental para streaming (M126) + prefijo
+└── fileread.ray      # lectura por trozos y rangos (seek para reanudar)
 ```
 
 ## Releases
@@ -140,10 +155,10 @@ y los sube a la Release del tag como `takeit-<target>.tar.gz` (+ `.sha256`).
 
 ```sh
 # Ejemplo de corte de versión
-# 1. Bump version en ray.toml → 0.2.0
+# 1. Bump version en ray.toml → 0.3.0
 # 2. Commit y:
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 ## Licencia

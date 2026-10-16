@@ -88,7 +88,35 @@ pub fn run(opts: SendOpts) -> int {
                                     1
                                 },
                                 Result.Ok(c2) => {
-                                    let code = stream_file(c2, key, name, size, opts.path);
+                                    let code = match (stream_file(
+                                        c2,
+                                        key,
+                                        name,
+                                        size,
+                                        opts.path,
+                                        protocol.DEFAULT_CHUNK
+                                    )) {
+                                        Result.Err(e) => {
+                                            eprint("\n" + e);
+                                            1
+                                        },
+                                        Result.Ok(sent) => {
+                                            let note = if (sent.offset > 0) {
+                                                ", resumed at " + progress.format_bytes(sent.offset)
+                                            } else {
+                                                ""
+                                            };
+                                            print(
+                                                "Sent: "
+                                                    + name
+                                                    + " ("
+                                                    + progress.format_bytes(size)
+                                                    + note
+                                                    + ")"
+                                            );
+                                            0
+                                        },
+                                    };
                                     framing.close_conn(c2);
                                     code
                                 },
@@ -101,28 +129,107 @@ pub fn run(opts: SendOpts) -> int {
     }
 }
 
-fn stream_file(c: framing.Conn, key: bytes, name: string, size: int, path: string) -> int {
-    let chunk = protocol.DEFAULT_CHUNK;
-    var conn = c;
-    var index = 0;
-    var offset = 0;
-    let hh = match (streamhash.init()) {
+/// A finished transfer: where the data started (the prefix the receiver already had) and
+/// how many file bytes crossed the wire.
+pub struct Sent {
+    offset: int,
+    sent: int,
+}
+
+/// Agrees where the data starts: the receiver's offset when its prefix matches this file
+/// byte for byte, 0 otherwise (a different file, a torn tail, an offset past the end).
+/// Returns the offset and the hasher to go on with, already fed with that prefix.
+fn agree_offset(
+    r: protocol.Resume,
+    path: string,
+    size: int,
+    hh: int
+) -> Result<(int, int), string> {
+    if (r.offset == 0 || r.offset > size) {
+        return Result.Ok((0, hh));
+    }
+    let prefix = match (streamhash.prefix_of(path, r.offset, protocol.DEFAULT_CHUNK, hh)) {
         Result.Err(e) => {
-            eprint("\n" + e);
-            return 1;
+            return Result.Err(e);
+        },
+        Result.Ok(d) => d,
+    };
+    if (crypto.constant_time_eq(prefix, r.prefix_digest)) {
+        return Result.Ok((r.offset, hh));
+    }
+    match (streamhash.restart(hh)) {
+        Result.Err(e) => Result.Err(e),
+        Result.Ok(fresh) => Result.Ok((0, fresh)),
+    }
+}
+
+/// Sender side of an authenticated session: reads the receiver's resume offer, answers
+/// with the start offset, streams the rest of `path` in `chunk`-byte pieces and waits for
+/// the final ACK.
+pub fn stream_file(
+    c: framing.Conn,
+    key: bytes,
+    name: string,
+    size: int,
+    path: string,
+    chunk: int
+) -> Result<Sent, string> {
+    let offer = match (protocol.recv_sealed(c, key, protocol.FROM_RECEIVER, 0, name, size)) {
+        Result.Err(e) => {
+            return Result.Err(e);
+        },
+        Result.Ok(ch) => ch,
+    };
+    if (offer.kind != protocol.KIND_RESUME) {
+        return Result.Err("expected a resume frame, got kind " + to_string(offer.kind));
+    }
+    let resume = match (protocol.decode_resume(offer.body)) {
+        Result.Err(e) => {
+            return Result.Err(e);
+        },
+        Result.Ok(r) => r,
+    };
+    let fresh = match (streamhash.init()) {
+        Result.Err(e) => {
+            return Result.Err(e);
         },
         Result.Ok(h) => h,
     };
-    var meter = progress.start("sending", size);
-    var send_err = "";
+    let (start, hh) = match (agree_offset(resume, path, size, fresh)) {
+        Result.Err(e) => {
+            return Result.Err(e);
+        },
+        Result.Ok(pair) => pair,
+    };
+    if (start > 0) {
+        eprint("receiver already has " + progress.format_bytes(start) + "; sending the rest");
+    } else if (resume.offset > 0) {
+        eprint("receiver's partial file does not match; sending from the start");
+    }
+    var conn = match (protocol.send_chunk(
+        offer.conn,
+        key,
+        0,
+        name,
+        size,
+        protocol.KIND_START,
+        protocol.be64(start)
+    )) {
+        Result.Err(e) => {
+            return Result.Err(e);
+        },
+        Result.Ok(c1) => c1,
+    };
 
-    // Resume: cuando el protocolo aporte el offset ya recibido, usar
-    // fileread.for_each_chunk_from(path, start, chunk, …) en lugar de for_each_chunk.
-    match (fileread.for_each_chunk(path, chunk, fn(piece: bytes) -> Result<int, string> {
+    var index = 1;
+    var offset = start;
+    var meter = progress.start_from("sending", size, start);
+    var send_err = "";
+    match (fileread.for_each_chunk_from(path, start, chunk, fn(piece: bytes) -> Result<int, string> {
         if (send_err.len() > 0) {
             return Result.Err(send_err);
         }
-        match (protocol.send_chunk(conn, key, index, name, size, 1, piece)) {
+        match (protocol.send_chunk(conn, key, index, name, size, protocol.KIND_DATA, piece)) {
             Result.Err(e) => {
                 send_err = e;
                 Result.Err(e)
@@ -145,44 +252,35 @@ fn stream_file(c: framing.Conn, key: bytes, name: string, size: int, path: strin
         }
     })) {
         Result.Err(e) => {
-            eprint("\n" + e);
-            return 1;
+            return Result.Err(e);
         },
         Result.Ok(_) => { },
     }
 
     if (offset != size) {
-        eprint("\nread size (" + to_string(offset) + ") != expected (" + to_string(size) + ")");
-        return 1;
+        return Result.Err(
+            "read size (" + to_string(offset) + ") != expected (" + to_string(size) + ")"
+        );
     }
 
     let digest = match (streamhash.digest(hh)) {
         Result.Err(e) => {
-            eprint("\n" + e);
-            return 1;
+            return Result.Err(e);
         },
         Result.Ok(d) => d,
     };
 
-    match (protocol.send_chunk(conn, key, index, name, size, 2, digest)) {
-        Result.Err(e) => {
-            eprint("\n" + e);
-            1
-        },
+    match (protocol.send_chunk(conn, key, index, name, size, protocol.KIND_DONE, digest)) {
+        Result.Err(e) => Result.Err(e),
         Result.Ok(c3) => match (framing.read_frame(c3, 16)) {
-            Result.Err(e) => {
-                eprint("\nwaiting for ACK: " + e);
-                1
-            },
+            Result.Err(e) => Result.Err("waiting for ACK: " + e),
             Result.Ok(pair) => {
                 let (_c4, ack) = pair;
                 if (ack == b"OK") {
                     progress.finish(meter);
-                    print("Sent: " + name + " (" + progress.format_bytes(size) + ")");
-                    0
+                    Result.Ok(Sent { offset: start, sent: size - start })
                 } else {
-                    eprint("\nunexpected ACK");
-                    1
+                    Result.Err("unexpected ACK")
                 }
             },
         },
