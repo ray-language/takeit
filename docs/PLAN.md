@@ -2,7 +2,7 @@
 
 ## Objetivo
 
-CLI peer-to-peer: un equipo **envía** un archivo y otro **recibe** con la misma app. El canal va cifrado de extremo a extremo; al enviar se genera una **contraseña aleatoria** que el receptor debe introducir (fuera de banda: chat, voz, etc.).
+CLI peer-to-peer: un equipo **envía** archivos o carpetas y otro **recibe** con la misma app. El canal va cifrado de extremo a extremo; al enviar se genera una **contraseña aleatoria** que el receptor debe introducir (fuera de banda: chat, voz, etc.).
 
 ## Decisiones v1 (por defecto)
 
@@ -52,24 +52,23 @@ Durante la transferencia, stderr muestra progreso (`enviando`/`recibiendo` con %
 1. **Contraseña fuera de banda** — único secreto compartido.
 2. **Salt público** (16 B) en el handshake en claro.
 3. **KDF v1**: `key = hmac_sha256(sha256(password_utf8), salt ‖ "takeit-v1")`.
-4. **Payload**: chunks AEAD; nonce = `contador u64 BE ‖ dirección u32 BE` (12 B; 0 = emisor, 1 = receptor: ambos cifran con la misma clave desde v3, así que cada dirección tiene su propio espacio de nonces); AAD = índice + nombre + tamaño.
+4. **Payload**: frames AEAD; nonce = `contador u64 BE ‖ dirección u32 BE` (12 B; 0 = emisor, 1 = receptor: ambos cifran con la misma clave, así que cada dirección tiene su propio espacio de nonces); AAD = índice + archivo + tamaño total.
 5. **Integridad**: fallo de `open` → abortar (tampering / contraseña mala).
 6. **TLS** (futuro): no sustituye el E2E por contraseña.
 
 ## Protocolo (sobre TCP)
 
-Frames: `u32 BE length` + payload.
+Frames: `u32 BE length` + payload. Contrato completo: [`PROTOCOL_V4.md`](PROTOCOL_V4.md).
 
 | Fase | Contenido |
 |------|-----------|
-| 1. Hello (claro) | magic `TAKE`, versión, salt, nombre, tamaño, chunk_size |
+| 1. Hello (claro) | magic `TAKE`, versión 4, salt, nº de archivos, tamaño total, chunk_size |
 | 2. Auth | emisor envía nonce; ambos calculan `hmac(key, "auth"‖nonce)`; receptor responde |
-| 3. Resume (v3) | receptor → emisor, cifrado: `offset u64 BE ‖ sha256(prefijo)` de lo que ya tiene (0 = nada) |
-| 4. Start (v3) | emisor → receptor, cifrado: `offset u64 BE` desde el que envía (el ofrecido o 0) |
-| 5. Data | frames cifrados con el resto del archivo |
-| 6. Done | SHA-256 del plaintext **completo** (frame autenticado) + ACK |
-
-Un solo archivo por sesión en v1.
+| 3. Manifest | rutas relativas + tamaños, cifrado |
+| 4. Resume | receptor → emisor: por archivo, bytes que ya tiene + SHA-256 de ellos |
+| 5. Start | emisor → receptor: por archivo, offset desde el que envía (el ofrecido o 0) |
+| 6. Por archivo | FileBegin → Data* (solo lo que falta) → FileDone (SHA-256 del archivo completo) |
+| 7. SessionDone | SHA-256 de los digests; el receptor renombra todo y responde `OK` |
 
 ## Arquitectura del código
 
@@ -82,7 +81,9 @@ takeit/
 │   ├── password.ray      # generar/normalizar contraseña
 │   ├── kdf.ray           # password + salt → key 32 B
 │   ├── framing.ray       # Conn + read_exact / write_frame
-│   ├── protocol.ray      # hello, auth, chunks
+│   ├── protocol.ray      # hello, manifiesto, resume/start, frames AEAD, blobs
+│   ├── paths.ray         # validación de rutas del manifiesto
+│   ├── sources.ray       # expansión de archivos/carpetas del emisor
 │   ├── send.ray
 │   ├── recv.ray
 │   ├── progress.ray      # barra de progreso + map de timeouts
@@ -90,28 +91,29 @@ takeit/
 │   └── fileread.ray      # lectura por trozos y rangos (fs.read_bytes/seek)
 └── tests/
     ├── chunk_review_test.ray
-    └── roundtrip_test.ray     # sesiones reales: nueva, cortada + reanudada, prefijos inválidos
+    ├── sources_test.ray       # expansión de carpetas, enlaces, colisiones
+    └── roundtrip_test.ray     # sesiones reales: 1 y N archivos, corte + reanudación, manifiestos hostiles
 ```
 
-## Reanudación (protocolo v3)
+## Reanudación
 
-Una transferencia cortada (red caída, emisor cerrado, timeout) deja en el receptor
-`<out>.takeit.partial` con los bytes ya escritos. Es **seguro conservarlos**: cada chunk se
-autentica con AEAD antes de escribirse. La siguiente sesión (otro `takeit send` del mismo
-archivo, con contraseña nueva) los aprovecha:
+Una transferencia cortada (red caída, emisor cerrado, timeout) deja en el receptor un
+`<destino>.takeit.partial` por cada archivo empezado, **completos incluidos**: los archivos solo
+se renombran a su sitio cuando la sesión entera se verifica. Conservarlos es seguro: cada chunk
+se autentica con AEAD antes de escribirse. La siguiente sesión (otro `takeit send` de lo mismo,
+contraseña nueva) los aprovecha:
 
-1. Tras el auth, el receptor re-hashea su parcial y envía `Resume { offset, sha256(prefijo) }`
-   (offset 0 si no hay parcial, si es más largo que el archivo anunciado o con `--fresh`).
-2. El emisor hashea los primeros `offset` bytes de **su** archivo. Si coinciden, responde
-   `Start { offset }` y envía solo la cola (`fileread.for_each_chunk_from`); si no (otro archivo
-   con el mismo nombre, cola rota tras un corte de luz), `Start { 0 }` y el receptor trunca.
-3. El `Done` lleva el SHA-256 del archivo **completo**: ambos lados alimentan su hasher con el
-   prefijo antes de la cola (`streamhash.prefix_of` hashea prefijo y total en una pasada,
-   porque el hasher no se puede bifurcar).
+1. Tras el manifiesto, el receptor ofrece por cada archivo la longitud de su parcial y su
+   SHA-256 (0 si no hay, si es más largo que el archivo o con `--fresh`).
+2. El emisor hashea los mismos bytes de **su** archivo: si coinciden, envía desde ahí
+   (`fileread.for_each_chunk_from`); si no (otro archivo con el mismo nombre, una cola rota
+   tras un corte de luz), desde 0 y el receptor trunca.
+3. FileDone lleva el SHA-256 del archivo **completo**: ambos lados alimentan su hasher con el
+   prefijo antes de la cola (`streamhash.feed`). El prefijo se lee dos veces (para la oferta y
+   para el hash final), porque el hasher no se puede bifurcar y no conviene tener N abiertos.
 
-El parcial solo se borra si falla la verificación final (digest o tamaño); cualquier otro
-error lo deja para el siguiente intento. El progreso cuenta el prefijo en el porcentaje pero no
-en la velocidad ni en el ETA (`progress.start_from`).
+Un parcial solo se borra si falla su verificación (digest o tamaño). El progreso cuenta lo
+reanudado en el porcentaje pero no en la velocidad ni en el ETA (`progress.start_from`).
 
 ## Fases
 
@@ -125,8 +127,8 @@ en la velocidad ni en el ETA (`progress.start_from`).
 | 5 | progreso, timeouts | ✅ |
 | 6 | relay / códigos cortos (opcional) | pendiente |
 | 7 | `ray build --native -o takeit --release` | ✅ (CI de releases multi-target) |
-| 8 | multi-archivo (protocolo v4) | documentado → [`PROTOCOL_V4.md`](PROTOCOL_V4.md) |
-| 9 | resume de transferencia | ✅ protocolo v3 (ver arriba) |
+| 8 | multi-archivo (protocolo v4) | ✅ → [`PROTOCOL_V4.md`](PROTOCOL_V4.md) |
+| 9 | resume de transferencia | ✅ por archivo, dentro de v4 (ver arriba) |
 
 ## Flujo
 
@@ -145,10 +147,14 @@ sequenceDiagram
   R->>R: derive key(password, salt)
   S->>R: auth challenge
   R->>S: auth response
-  loop chunks
-    S->>R: frame AEAD
-    R->>R: open + append file
+  S->>R: Manifest (AEAD)
+  R->>S: Resume: lo que ya tiene de cada archivo
+  S->>R: Start: offset por archivo
+  loop cada archivo
+    S->>R: FileBegin, Data*, FileDone (SHA-256)
+    R->>R: escribe el .takeit.partial, verifica, fsync
   end
-  S->>R: done + checksum
+  S->>R: SessionDone (SHA-256 de los digests)
+  R->>R: renombra todos los parciales
   R->>S: ACK
 ```

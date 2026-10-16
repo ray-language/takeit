@@ -1,4 +1,4 @@
-// Modo send: escucha, autentica y envía el archivo cifrado (streaming).
+// Modo send: escucha, autentica y envía uno o más archivos cifrados (streaming).
 import std/net;
 import std/fs;
 import std/crypto;
@@ -9,280 +9,268 @@ import kdf;
 import progress;
 import streamhash;
 import fileread;
+import sources;
 
 pub struct SendOpts {
-    path: string,
+    paths: [string],
     bind: string,
     port: int,
     timeout_ms: int,
 }
 
-fn basename(path: string) -> string {
-    let parts = path.split("/");
-    if (parts.len() == 0) {
-        return path;
-    }
-    let last = parts[parts.len() - 1];
-    if (last.len() == 0) { path } else { last }
-}
-
-pub fn run(opts: SendOpts) -> int {
-    match (fs.file_size(opts.path)) {
-        Result.Err(e) => {
-            eprint("could not read file: " + e);
-            1
-        },
-        Result.Ok(size) => match (net.tcp_listen(opts.bind, opts.port)) {
-            Result.Err(e) => {
-                eprint("could not listen: " + e);
-                1
-            },
-            Result.Ok(listener) => {
-                let port = net.local_port(listener);
-                let pw = password.generate();
-                let salt = crypto.random_bytes(protocol.SALT_LEN);
-                let key = kdf.derive_key(password.normalize(pw), salt);
-                let name = basename(opts.path);
-                print("Password: " + pw);
-                print("Waiting on " + opts.bind + ":" + to_string(port) + " …");
-                print(
-                    "Receiver should run: takeit recv --host <this-ip> --port "
-                        + to_string(port)
-                        + " --password "
-                        + pw
-                );
-                if (opts.timeout_ms > 0) {
-                    eprint("(idle/accept timeout: " + to_string(opts.timeout_ms / 1000) + "s)");
-                    net.set_read_timeout(listener, opts.timeout_ms);
-                }
-                match (net.tcp_accept(listener)) {
-                    Result.Err(e) => {
-                        if (e == "read timeout") {
-                            eprint("timed out waiting for receiver");
-                        } else {
-                            eprint("accept: " + progress.map_io_err(e));
-                        }
-                        close(listener);
-                        1
-                    },
-                    Result.Ok(sock) => {
-                        close(listener);
-                        var c0 = framing.from_handle(sock);
-                        c0 = framing.set_timeout(c0, opts.timeout_ms);
-                        let hello = protocol.Hello {
-                            salt: salt,
-                            name: name,
-                            size: size,
-                            chunk_size: protocol.DEFAULT_CHUNK
-                        };
-                        match (protocol.send_hello(c0, hello)) {
-                            Result.Err(e) => {
-                                eprint(e);
-                                framing.close_conn(c0);
-                                1
-                            },
-                            Result.Ok(c1) => match (protocol.auth_as_sender(c1, key)) {
-                                Result.Err(e) => {
-                                    eprint(e);
-                                    framing.close_conn(c1);
-                                    1
-                                },
-                                Result.Ok(c2) => {
-                                    let code = match (stream_file(
-                                        c2,
-                                        key,
-                                        name,
-                                        size,
-                                        opts.path,
-                                        protocol.DEFAULT_CHUNK
-                                    )) {
-                                        Result.Err(e) => {
-                                            eprint("\n" + e);
-                                            1
-                                        },
-                                        Result.Ok(sent) => {
-                                            let note = if (sent.offset > 0) {
-                                                ", resumed at " + progress.format_bytes(sent.offset)
-                                            } else {
-                                                ""
-                                            };
-                                            print(
-                                                "Sent: "
-                                                    + name
-                                                    + " ("
-                                                    + progress.format_bytes(size)
-                                                    + note
-                                                    + ")"
-                                            );
-                                            0
-                                        },
-                                    };
-                                    framing.close_conn(c2);
-                                    code
-                                },
-                            },
-                        }
-                    },
-                }
-            },
-        },
-    }
-}
-
-/// A finished transfer: where the data started (the prefix the receiver already had) and
-/// how many file bytes crossed the wire.
+/// A finished session: how many files, their total size, how much of it the receiver
+/// already had (resumed) and how many file bytes crossed the wire.
 pub struct Sent {
-    offset: int,
+    files: int,
+    total: int,
+    resumed: int,
     sent: int,
 }
 
-/// Agrees where the data starts: the receiver's offset when its prefix matches this file
-/// byte for byte, 0 otherwise (a different file, a torn tail, an offset past the end).
-/// Returns the offset and the hasher to go on with, already fed with that prefix.
-fn agree_offset(
-    r: protocol.Resume,
-    path: string,
-    size: int,
-    hh: int
-) -> Result<(int, int), string> {
-    if (r.offset == 0 || r.offset > size) {
-        return Result.Ok((0, hh));
-    }
-    let prefix = match (streamhash.prefix_of(path, r.offset, protocol.DEFAULT_CHUNK, hh)) {
+pub fn run(opts: SendOpts) -> int {
+    let collected = match (sources.collect(opts.paths)) {
         Result.Err(e) => {
-            return Result.Err(e);
+            eprint(e);
+            return 1;
         },
-        Result.Ok(d) => d,
+        Result.Ok(c) => c,
     };
-    if (crypto.constant_time_eq(prefix, r.prefix_digest)) {
-        return Result.Ok((r.offset, hh));
+    for s in collected.skipped {
+        eprint("skipping (not a regular file): " + s);
     }
-    match (streamhash.restart(hh)) {
+    let files = collected.sources;
+    let total = sources.total_size(files);
+    let listener = match (net.tcp_listen(opts.bind, opts.port)) {
+        Result.Err(e) => {
+            eprint("could not listen: " + e);
+            return 1;
+        },
+        Result.Ok(l) => l,
+    };
+    let port = net.local_port(listener);
+    let pw = password.generate();
+    let salt = crypto.random_bytes(protocol.SALT_LEN);
+    let key = kdf.derive_key(password.normalize(pw), salt);
+    print("Password: " + pw);
+    print("Waiting on " + opts.bind + ":" + to_string(port) + " …");
+    print(
+        "Receiver should run: takeit recv --host <this-ip> --port "
+            + to_string(port)
+            + " --password "
+            + pw
+    );
+    if (files.len() > 1) {
+        print("(" + to_string(files.len()) + " files, " + progress.format_bytes(total) + ")");
+    }
+    if (opts.timeout_ms > 0) {
+        eprint("(idle/accept timeout: " + to_string(opts.timeout_ms / 1000) + "s)");
+        net.set_read_timeout(listener, opts.timeout_ms);
+    }
+    let sock = match (net.tcp_accept(listener)) {
+        Result.Err(e) => {
+            if (e == "read timeout") {
+                eprint("timed out waiting for receiver");
+            } else {
+                eprint("accept: " + progress.map_io_err(e));
+            }
+            close(listener);
+            return 1;
+        },
+        Result.Ok(s) => s,
+    };
+    close(listener);
+    let c0 = framing.set_timeout(framing.from_handle(sock), opts.timeout_ms);
+    let hello = protocol.Hello {
+        salt: salt,
+        file_count: files.len(),
+        total_size: total,
+        chunk_size: protocol.DEFAULT_CHUNK
+    };
+    let outcome = match (protocol.send_hello(c0, hello)) {
         Result.Err(e) => Result.Err(e),
-        Result.Ok(fresh) => Result.Ok((0, fresh)),
+        Result.Ok(c1) => match (protocol.auth_as_sender(c1, key)) {
+            Result.Err(e) => Result.Err(e),
+            Result.Ok(c2) => stream_files(c2, key, files, protocol.DEFAULT_CHUNK),
+        },
+    };
+    framing.close_conn(c0);
+    match (outcome) {
+        Result.Err(e) => {
+            eprint("\n" + e);
+            1
+        },
+        Result.Ok(sent) => {
+            print("Sent: " + describe(files, sent));
+            0
+        },
     }
 }
 
-/// Sender side of an authenticated session: reads the receiver's resume offer, answers
-/// with the start offset, streams the rest of `path` in `chunk`-byte pieces and waits for
-/// the final ACK.
-pub fn stream_file(
+fn describe(files: [sources.Source], sent: Sent) -> string {
+    let what = if (files.len() == 1) {
+        files[0].entry.path
+    } else {
+        to_string(files.len()) + " files"
+    };
+    let note = if (sent.resumed > 0) {
+        ", resumed at " + progress.format_bytes(sent.resumed)
+    } else {
+        ""
+    };
+    what + " (" + progress.format_bytes(sent.total) + note + ")"
+}
+
+/// Where file `s` starts: the receiver's offset when its prefix matches this file byte
+/// for byte, 0 otherwise (another file, a torn tail, an offset past the end).
+fn agree(s: sources.Source, held: protocol.Held, chunk: int) -> Result<int, string> {
+    if (held.offset == 0 || held.offset > s.entry.size) {
+        return Result.Ok(0);
+    }
+    let prefix = streamhash.prefix_digest(s.local, held.offset, chunk)?;
+    if (crypto.constant_time_eq(prefix, held.digest)) {
+        Result.Ok(held.offset)
+    } else {
+        Result.Ok(0)
+    }
+}
+
+/// The progress label: the plain verb for one file, plus `i/N path` for a batch.
+pub fn label(verb: string, i: int, n: int, path: string) -> string {
+    if (n == 1) {
+        return verb;
+    }
+    let shown = if (path.len() > 40) {
+        "…" + path.substring(path.len() - 39, path.len())
+    } else {
+        path
+    };
+    verb + " " + to_string(i + 1) + "/" + to_string(n) + " " + shown
+}
+
+/// Sender side of an authenticated session: manifest, the receiver's resume offer, the
+/// start offsets, then FileBegin → Data* → FileDone per file, SessionDone and the ACK.
+pub fn stream_files(
     c: framing.Conn,
     key: bytes,
-    name: string,
-    size: int,
-    path: string,
+    files: [sources.Source],
     chunk: int
 ) -> Result<Sent, string> {
-    let offer = match (protocol.recv_sealed(c, key, protocol.FROM_RECEIVER, 0, name, size)) {
-        Result.Err(e) => {
-            return Result.Err(e);
-        },
-        Result.Ok(ch) => ch,
-    };
-    if (offer.kind != protocol.KIND_RESUME) {
-        return Result.Err("expected a resume frame, got kind " + to_string(offer.kind));
-    }
-    let resume = match (protocol.decode_resume(offer.body)) {
-        Result.Err(e) => {
-            return Result.Err(e);
-        },
-        Result.Ok(r) => r,
-    };
-    let fresh = match (streamhash.init()) {
-        Result.Err(e) => {
-            return Result.Err(e);
-        },
-        Result.Ok(h) => h,
-    };
-    let (start, hh) = match (agree_offset(resume, path, size, fresh)) {
-        Result.Err(e) => {
-            return Result.Err(e);
-        },
-        Result.Ok(pair) => pair,
-    };
-    if (start > 0) {
-        eprint("receiver already has " + progress.format_bytes(start) + "; sending the rest");
-    } else if (resume.offset > 0) {
-        eprint("receiver's partial file does not match; sending from the start");
-    }
-    var conn = match (protocol.send_chunk(
-        offer.conn,
-        key,
-        0,
-        name,
-        size,
-        protocol.KIND_START,
-        protocol.be64(start)
-    )) {
-        Result.Err(e) => {
-            return Result.Err(e);
-        },
-        Result.Ok(c1) => c1,
-    };
-
-    var index = 1;
-    var offset = start;
-    var meter = progress.start_from("sending", size, start);
-    var send_err = "";
-    match (fileread.for_each_chunk_from(path, start, chunk, fn(piece: bytes) -> Result<int, string> {
-        if (send_err.len() > 0) {
-            return Result.Err(send_err);
+    let n = files.len();
+    let total = sources.total_size(files);
+    var l = protocol.link(c, key, protocol.FROM_SENDER, total);
+    l = protocol.send_blob(
+        l,
+        protocol.KIND_MANIFEST,
+        protocol.encode_manifest(sources.entries(files))
+    )?;
+    let (l1, offer) = protocol.recv_blob(l, protocol.KIND_RESUME)?;
+    l = l1;
+    let held = protocol.decode_resume(offer, n)?;
+    var starts: [int] = [];
+    var resumed = 0;
+    var mismatched = 0;
+    var i = 0;
+    while (i < n) {
+        let s = agree(files[i], held[i], chunk)?;
+        if (s == 0 && held[i].offset > 0) {
+            mismatched = mismatched + 1;
         }
-        match (protocol.send_chunk(conn, key, index, name, size, protocol.KIND_DATA, piece)) {
-            Result.Err(e) => {
-                send_err = e;
-                Result.Err(e)
-            },
-            Result.Ok(c2) => {
-                conn = c2;
-                match (streamhash.update(hh, piece)) {
-                    Result.Err(e) => {
-                        send_err = e;
-                        Result.Err(e)
-                    },
-                    Result.Ok(_) => {
-                        index = index + 1;
-                        offset = offset + piece.len();
-                        meter = progress.tick(meter, offset);
-                        Result.Ok(0)
-                    },
-                }
-            },
-        }
-    })) {
-        Result.Err(e) => {
-            return Result.Err(e);
-        },
-        Result.Ok(_) => { },
+        starts.push(s);
+        resumed = resumed + s;
+        i = i + 1;
     }
-
-    if (offset != size) {
-        return Result.Err(
-            "read size (" + to_string(offset) + ") != expected (" + to_string(size) + ")"
+    if (resumed > 0) {
+        eprint("receiver already has " + progress.format_bytes(resumed) + "; sending the rest");
+    }
+    if (mismatched > 0) {
+        eprint(
+            to_string(mismatched) + " partial file(s) on the receiver do not match; resending them"
         );
     }
+    l = protocol.send_blob(l, protocol.KIND_START, protocol.encode_starts(starts))?;
 
-    let digest = match (streamhash.digest(hh)) {
-        Result.Err(e) => {
-            return Result.Err(e);
-        },
-        Result.Ok(d) => d,
-    };
-
-    match (protocol.send_chunk(conn, key, index, name, size, protocol.KIND_DONE, digest)) {
-        Result.Err(e) => Result.Err(e),
-        Result.Ok(c3) => match (framing.read_frame(c3, 16)) {
-            Result.Err(e) => Result.Err("waiting for ACK: " + e),
-            Result.Ok(pair) => {
-                let (_c4, ack) = pair;
-                if (ack == b"OK") {
-                    progress.finish(meter);
-                    Result.Ok(Sent { offset: start, sent: size - start })
-                } else {
-                    Result.Err("unexpected ACK")
-                }
-            },
-        },
+    let session = streamhash.init()?;
+    var meter = progress.start_from("sending", total, resumed);
+    var done = resumed;
+    i = 0;
+    while (i < n) {
+        let src = files[i];
+        let start = starts[i];
+        let index = i;
+        // The manifest promised this size; a file that changed since would not match it.
+        let now = fs.file_size(src.local)?;
+        if (now != src.entry.size) {
+            return Result.Err(
+                "${src.local} changed while sending (${now} bytes, announced ${src.entry.size})"
+            );
+        }
+        meter.label = label("sending", i, n, src.entry.path);
+        l = protocol.seal(l, index, protocol.KIND_FILE_BEGIN, protocol.be32(index))?;
+        let hh = streamhash.init()?;
+        if (start > 0) {
+            streamhash.feed(src.local, start, chunk, hh)?;
+        }
+        var send_err = "";
+        let read = fileread.for_each_chunk_from(src.local, start, chunk, fn(piece: bytes) -> Result<int, string> {
+            if (send_err.len() > 0) {
+                return Result.Err(send_err);
+            }
+            match (protocol.seal(l, index, protocol.KIND_DATA, piece)) {
+                Result.Err(e) => {
+                    send_err = e;
+                    Result.Err(e)
+                },
+                Result.Ok(next) => {
+                    l = next;
+                    match (streamhash.update(hh, piece)) {
+                        Result.Err(e) => {
+                            send_err = e;
+                            Result.Err(e)
+                        },
+                        Result.Ok(_) => {
+                            done = done + piece.len();
+                            meter = progress.tick(meter, done);
+                            Result.Ok(0)
+                        },
+                    }
+                },
+            }
+        })?;
+        if (start + read != src.entry.size) {
+            return Result.Err(
+                "read ${start + read} bytes of ${src.local}, expected ${src.entry.size}"
+            );
+        }
+        let digest = streamhash.digest(hh)?;
+        l = protocol.seal(
+            l,
+            index,
+            protocol.KIND_FILE_DONE,
+            protocol.encode_index_digest(index, digest)
+        )?;
+        streamhash.update(session, digest)?;
+        i = i + 1;
     }
+    let session_digest = streamhash.digest(session)?;
+    l = protocol.seal(
+        l,
+        protocol.NO_FILE,
+        protocol.KIND_SESSION_DONE,
+        protocol.encode_index_digest(n, session_digest)
+    )?;
+    let ack = match (framing.read_frame(l.conn, 16)) {
+        Result.Err(e) => {
+            return Result.Err("waiting for ACK: " + e);
+        },
+        Result.Ok(pair) => {
+            let (_c, a) = pair;
+            a
+        },
+    };
+    if (ack != b"OK") {
+        return Result.Err("unexpected ACK");
+    }
+    meter.label = "sending";
+    progress.finish(meter);
+    Result.Ok(Sent { files: n, total: total, resumed: resumed, sent: total - resumed })
 }

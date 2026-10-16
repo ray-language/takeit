@@ -1,0 +1,99 @@
+// Entradas de `takeit send`: archivos y directorios → la lista ordenada del manifiesto.
+import std/fs;
+import paths;
+import protocol;
+
+/// A file to send: where it lives on disk and the entry the manifest announces for it.
+pub struct Source {
+    local: string,
+    entry: protocol.Entry,
+}
+
+/// The expanded arguments, plus what was left out (symlinks and special files found
+/// inside directories).
+pub struct Collected {
+    sources: [Source],
+    skipped: [string],
+}
+
+fn walk(local: string, wire: string, acc: Collected) -> Result<Collected, string> {
+    var a = acc;
+    for name in fs.list_dir(local)? {
+        let lp = local + "/" + name;
+        let wp = wire + "/" + name;
+        let st = fs.stat(lp)?;
+        if (st.kind == "file") {
+            a.sources.push(Source { local: lp, entry: protocol.Entry { path: wp, size: st.size } });
+        } else if (st.kind == "dir") {
+            a = walk(lp, wp, a)?;
+        } else {
+            a.skipped.push(lp);
+        }
+    }
+    Result.Ok(a)
+}
+
+/// Expands the CLI arguments in order: a file goes under its own name; a directory goes
+/// recursively under ITS name (`fotos/2026/a.jpg`), like `scp -r`. An argument that is a
+/// symlink is followed; symlinks found inside directories are skipped (not followed).
+/// Every wire path must pass `paths.check` and be unique.
+pub fn collect(args: [string]) -> Result<Collected, string> {
+    var acc = Collected { sources: [], skipped: [] };
+    for arg in args {
+        let real = match (fs.real_path(arg)) {
+            Result.Err(e) => {
+                return Result.Err("could not read ${arg}: ${e}");
+            },
+            Result.Ok(r) => r,
+        };
+        let st = fs.stat(real)?;
+        let name = paths.base_name(real);
+        if (st.kind == "file") {
+            acc.sources.push(
+                Source { local: real, entry: protocol.Entry { path: name, size: st.size } }
+            );
+        } else if (st.kind == "dir") {
+            acc = walk(real, name, acc)?;
+        } else {
+            return Result.Err("not a regular file or directory: ${arg}");
+        }
+    }
+    if (acc.sources.len() == 0) {
+        return Result.Err("nothing to send (no regular files)");
+    }
+    if (acc.sources.len() > protocol.MAX_FILES) {
+        return Result.Err("too many files: ${acc.sources.len()} (at most ${protocol.MAX_FILES})");
+    }
+    var seen: Map<string, string> = Map.new();
+    for s in acc.sources {
+        match (paths.check(s.entry.path)) {
+            Result.Err(_) => {
+                return Result.Err(
+                    "cannot send ${s.local}: its name is not portable (${s.entry.path})"
+                );
+            },
+            Result.Ok(_) => { },
+        }
+        match (seen.get(s.entry.path)) {
+            Option.Some(other) => {
+                return Result.Err("${other} and ${s.local} would both arrive as ${s.entry.path}");
+            },
+            Option.None => seen.insert(s.entry.path, s.local),
+        }
+    }
+    Result.Ok(acc)
+}
+
+/// The manifest entries of `sources`, in order.
+pub fn entries(sources: [Source]) -> [protocol.Entry] {
+    sources.map(fn(s: Source) -> protocol.Entry { s.entry })
+}
+
+/// Sum of the sizes.
+pub fn total_size(sources: [Source]) -> int {
+    var t = 0;
+    for s in sources {
+        t = t + s.entry.size;
+    }
+    t
+}

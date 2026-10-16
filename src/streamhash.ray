@@ -21,34 +21,24 @@ pub fn digest(h: int) -> Result<bytes, string> {
     crypto.hash_final(h)
 }
 
-/// Hashes the first `len` bytes of `path` into `full` (which goes on with the rest of the
-/// file) and returns the SHA-256 of that prefix alone. The hasher has no fork, so a second
-/// one is fed in the same pass.
-pub fn prefix_of(path: string, len: int, chunk_size: int, full: int) -> Result<bytes, string> {
-    let prefix = match (init()) {
-        Result.Err(e) => {
-            return Result.Err(e);
-        },
-        Result.Ok(h) => h,
-    };
-    match (fileread.for_each_chunk_range(path, 0, len, chunk_size, fn(piece: bytes) -> Result<int, string> {
-        match (update(prefix, piece)) {
-            Result.Err(e) => Result.Err(e),
-            Result.Ok(_) => update(full, piece),
-        }
-    })) {
-        Result.Err(e) => {
-            let _ = digest(prefix);
-            Result.Err(e)
-        },
-        Result.Ok(_) => digest(prefix),
-    }
+/// Feeds the first `len` bytes of `path` into `h`: a resumed file's hash must cover the
+/// prefix the peer already has before the tail that crosses the wire.
+pub fn feed(path: string, len: int, chunk_size: int, h: int) -> Result<int, string> {
+    fileread.for_each_chunk_range(path, 0, len, chunk_size, fn(piece: bytes) -> Result<int, string> {
+        update(h, piece)
+    })
 }
 
-/// Discards whatever `h` has absorbed and returns a fresh hasher.
-pub fn restart(h: int) -> Result<int, string> {
-    let _ = digest(h);
-    init()
+/// SHA-256 of the first `len` bytes of `path`.
+pub fn prefix_digest(path: string, len: int, chunk_size: int) -> Result<bytes, string> {
+    let h = init()?;
+    match (feed(path, len, chunk_size, h)) {
+        Result.Err(e) => {
+            let _ = digest(h);
+            Result.Err(e)
+        },
+        Result.Ok(_) => digest(h),
+    }
 }
 
 @test

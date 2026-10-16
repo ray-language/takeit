@@ -1,4 +1,4 @@
-// Modo recv: conecta, autentica y escribe a disco por streaming.
+// Modo recv: conecta, autentica y escribe a disco por streaming, uno o más archivos.
 import std/net;
 import std/fs;
 import std/crypto;
@@ -8,6 +8,8 @@ import password;
 import kdf;
 import progress;
 import streamhash;
+import paths;
+import send;
 
 pub struct RecvOpts {
     host: string,
@@ -15,7 +17,7 @@ pub struct RecvOpts {
     password: string,
     out: string,
     timeout_ms: int,
-    /// Resume from a `<out>.takeit.partial` left by an interrupted transfer (default).
+    /// Resume from the `*.takeit.partial` files an interrupted transfer left (default).
     resume: bool,
 }
 
@@ -23,299 +25,386 @@ pub fn run(opts: RecvOpts) -> int {
     // tcp_connect_timeout (raylang M122): a hung or dropping host fails fast instead of
     // parking the connect forever. Reuse the idle timeout; fall back to 10s when disabled.
     let connect_ms = if (opts.timeout_ms > 0) { opts.timeout_ms } else { 10000 };
-    match (net.tcp_connect_timeout(opts.host, opts.port, connect_ms)) {
+    let sock = match (net.tcp_connect_timeout(opts.host, opts.port, connect_ms)) {
         Result.Err(e) => {
             eprint("could not connect: " + e);
-            1
+            return 1;
         },
-        Result.Ok(sock) => {
-            var c0 = framing.from_handle(sock);
-            c0 = framing.set_timeout(c0, opts.timeout_ms);
-            match (protocol.recv_hello(c0)) {
-                Result.Err(e) => {
-                    eprint(e);
-                    framing.close_conn(c0);
-                    1
-                },
-                Result.Ok(pair) => {
-                    let (c1, hello) = pair;
-                    let key = kdf.derive_key(password.normalize(opts.password), hello.salt);
-                    match (protocol.auth_as_receiver(c1, key)) {
-                        Result.Err(e) => {
-                            eprint(e);
-                            framing.close_conn(c1);
-                            1
-                        },
-                        Result.Ok(c2) => {
-                            let out_path = if (opts.out.len() > 0) { opts.out } else { hello.name };
-                            eprint(
-                                "receiving "
-                                    + hello.name
-                                    + " ("
-                                    + progress.format_bytes(hello.size)
-                                    + ")"
-                            );
-                            let code = match (receive_file(c2, key, hello, out_path, opts.resume)) {
-                                Result.Err(e) => {
-                                    eprint("\n" + e);
-                                    let tmp = partial_path(out_path);
-                                    if (fs.exists(tmp)) {
-                                        eprint(
-                                            "partial file kept: "
-                                                + tmp
-                                                + " (receive the same file again to resume)"
-                                        );
-                                    }
-                                    1
-                                },
-                                Result.Ok(got) => {
-                                    let note = if (got.offset > 0) {
-                                        ", resumed at " + progress.format_bytes(got.offset)
-                                    } else {
-                                        ""
-                                    };
-                                    print(
-                                        "Saved: "
-                                            + out_path
-                                            + " ("
-                                            + progress.format_bytes(got.size)
-                                            + note
-                                            + ")"
-                                    );
-                                    0
-                                },
-                            };
-                            framing.close_conn(c2);
-                            code
-                        },
-                    }
+        Result.Ok(s) => s,
+    };
+    let c0 = framing.set_timeout(framing.from_handle(sock), opts.timeout_ms);
+    let outcome = match (protocol.recv_hello(c0)) {
+        Result.Err(e) => Result.Err(e),
+        Result.Ok(pair) => {
+            let (c1, hello) = pair;
+            let key = kdf.derive_key(password.normalize(opts.password), hello.salt);
+            match (protocol.auth_as_receiver(c1, key)) {
+                Result.Err(e) => Result.Err(e),
+                Result.Ok(c2) => {
+                    let what = if (hello.file_count == 1) {
+                        "1 file"
+                    } else {
+                        to_string(hello.file_count) + " files"
+                    };
+                    eprint(
+                        "receiving " + what + " (" + progress.format_bytes(hello.total_size) + ")"
+                    );
+                    receive_files(c2, key, hello, opts.out, opts.resume)
                 },
             }
         },
-    }
-}
-
-/// Where the bytes of `out_path` accumulate until the transfer is complete and verified.
-/// It survives an interrupted transfer: the next one resumes from it.
-pub fn partial_path(out_path: string) -> string {
-    out_path + ".takeit.partial"
-}
-
-/// A finished transfer: the offset it resumed from (0 = from scratch) and the file size.
-pub struct Received {
-    offset: int,
-    size: int,
-}
-
-/// What the receiver offers to resume from: the partial file's length when it can be a
-/// prefix of this file (0 otherwise), with `hh` already fed with those bytes.
-fn offer_from(tmp: string, size: int, resume: bool, hh: int) -> Result<protocol.Resume, string> {
-    let held = if (resume) {
-        match (fs.file_size(tmp)) {
-            Result.Ok(n) => if (n <= size) { n } else { 0 },
-            Result.Err(_) => 0,
-        }
-    } else {
-        0
     };
-    if (held == 0) {
-        return Result.Ok(protocol.Resume { offset: 0, prefix_digest: crypto.sha256(b"") });
-    }
-    match (streamhash.prefix_of(tmp, held, protocol.DEFAULT_CHUNK, hh)) {
-        Result.Err(e) => Result.Err(e),
-        Result.Ok(d) => Result.Ok(protocol.Resume { offset: held, prefix_digest: d }),
+    framing.close_conn(c0);
+    match (outcome) {
+        Result.Err(e) => {
+            eprint("\n" + e);
+            1
+        },
+        Result.Ok(got) => {
+            let note = if (got.resumed > 0) {
+                ", resumed at " + progress.format_bytes(got.resumed)
+            } else {
+                ""
+            };
+            print("Saved: " + got.dest + " (" + progress.format_bytes(got.total) + note + ")");
+            0
+        },
     }
 }
 
-/// Receiver side of an authenticated session: offers what `<out_path>.takeit.partial`
-/// already holds, then writes the rest of the stream after it. On success the partial
-/// file is synced and renamed to `out_path`; on a transport failure it is KEPT so the
-/// next transfer resumes; only a failed integrity check (digest or size) removes it.
-pub fn receive_file(
+/// Where the bytes of `final_path` accumulate until the whole session is verified. It
+/// survives an interrupted transfer: the next one resumes from it.
+pub fn partial_path(final_path: string) -> string {
+    final_path + ".takeit.partial"
+}
+
+/// A finished session: files, total size, bytes that were already here, and what to
+/// show as the destination.
+pub struct Received {
+    files: int,
+    total: int,
+    resumed: int,
+    dest: string,
+}
+
+/// Where each manifest entry lands. A batch of ONE plain file may name the target FILE
+/// with `--out` (when it is not an existing directory and does not end in `/`); any
+/// other batch goes under a directory — `--out`, or the current one.
+pub struct Plan {
+    base: string,
+    finals: [string],
+    /// Paths are confined to `base` (multi-file or directory mode).
+    confined: bool,
+}
+
+fn is_dir(path: string) -> bool {
+    match (fs.stat(path)) {
+        Result.Ok(st) => st.kind == "dir",
+        Result.Err(_) => false,
+    }
+}
+
+fn join(base: string, rel: string) -> string {
+    if (base == ".") { rel } else { base + "/" + rel }
+}
+
+pub fn plan(entries: [protocol.Entry], out: string) -> Plan {
+    if (entries.len() == 1
+        && !entries[0].path.contains("/")
+        && out != ""
+        && !out.ends_with("/")
+        && !is_dir(out)) {
+        return Plan { base: paths.parent(out), finals: [out], confined: false };
+    }
+    var base = if (out == "") { "." } else { out };
+    while (base.len() > 1 && base.ends_with("/")) {
+        base = base.substring(0, base.len() - 1);
+    }
+    let b = base;
+    Plan {
+        base: base,
+        finals: entries.map(fn(e: protocol.Entry) -> string { join(b, e.path) }),
+        confined: true
+    }
+}
+
+/// Refuses a destination whose existing parent resolves outside `base` (a symlinked
+/// directory inside the output folder pointing elsewhere). A parent that does not exist
+/// yet is checked again once created.
+fn check_confined(p: Plan, final_path: string) -> Result<int, string> {
+    if (!p.confined) {
+        return Result.Ok(0);
+    }
+    let parent = paths.parent(final_path);
+    if (!fs.exists(parent)) {
+        return Result.Ok(0);
+    }
+    if (!fs.is_within_real(parent, p.base)?) {
+        return Result.Err("refusing to write outside ${p.base}: ${final_path}");
+    }
+    Result.Ok(0)
+}
+
+/// Length of the partial file at `tmp` (0 if there is none). Anything but a regular file
+/// there (a symlink planted where the partial goes) is refused, never written through.
+fn partial_size(tmp: string) -> Result<int, string> {
+    match (fs.stat(tmp)) {
+        Result.Err(_) => Result.Ok(0),
+        Result.Ok(st) => {
+            if (st.kind != "file") {
+                return Result.Err("refusing to write through ${tmp}: it is a ${st.kind}");
+            }
+            Result.Ok(st.size)
+        },
+    }
+}
+
+/// What this side offers to resume for one entry: the partial's length when it can be a
+/// prefix of the file (0 otherwise), with the SHA-256 of those bytes.
+fn offer_for(tmp: string, size: int, resume: bool) -> Result<protocol.Held, string> {
+    let held = partial_size(tmp)?;
+    if (!resume || held == 0 || held > size) {
+        return Result.Ok(protocol.Held { offset: 0, digest: crypto.sha256(b"") });
+    }
+    let d = streamhash.prefix_digest(tmp, held, protocol.DEFAULT_CHUNK)?;
+    Result.Ok(protocol.Held { offset: held, digest: d })
+}
+
+/// A failure while receiving one file; `discard` = its partial is proven bad (digest or
+/// size), so keeping it for a resume would only fail again.
+struct Fail {
+    msg: string,
+    discard: bool,
+}
+
+impl From<string> for Fail {
+    fn convert(source: string) -> Fail {
+        Fail { msg: source, discard: false }
+    }
+}
+
+fn condemn(msg: string) -> Fail {
+    Fail { msg: msg, discard: true }
+}
+
+/// The running state threaded through the per-file loop.
+struct Progress {
+    link: protocol.Link,
+    meter: progress.Meter,
+    done: int,
+}
+
+/// Data* → FileDone of file `i` into the open handle `fh`; returns its verified digest.
+fn pump(
+    st: Progress,
+    i: int,
+    entry: protocol.Entry,
+    start: int,
+    fh: int,
+    hh: int
+) -> Result<(Progress, bytes), Fail> {
+    var s = st;
+    var written = start;
+    while (true) {
+        let (next, f) = protocol.open(s.link, i)?;
+        s.link = next;
+        if (f.kind == protocol.KIND_DATA) {
+            if (written + f.body.len() > entry.size) {
+                return Result.Err(
+                    condemn("${entry.path}: more data than the announced ${entry.size} bytes")
+                );
+            }
+            fs.write_bytes(fh, f.body)?;
+            streamhash.update(hh, f.body)?;
+            written = written + f.body.len();
+            s.done = s.done + f.body.len();
+            s.meter = progress.tick(s.meter, s.done);
+        } else if (f.kind == protocol.KIND_FILE_DONE) {
+            let (index, want) = protocol.decode_index_digest(f.body)?;
+            if (index != i) {
+                return Result.Err(
+                    Fail { msg: "FileDone for file ${index} while receiving ${i}", discard: false }
+                );
+            }
+            let got = streamhash.digest(hh)?;
+            if (got != want) {
+                return Result.Err(condemn("${entry.path}: checksum mismatch"));
+            }
+            if (written != entry.size) {
+                return Result.Err(
+                    condemn("${entry.path}: got ${written} bytes, expected ${entry.size}")
+                );
+            }
+            // Durable before it counts: the session renames only synced files.
+            fs.sync(fh)?;
+            return Result.Ok((s, got));
+        } else {
+            return Result.Err(
+                Fail { msg: "unexpected frame kind ${f.kind} inside ${entry.path}", discard: false }
+            );
+        }
+    }
+    Result.Err(Fail { msg: "unreachable", discard: false })
+}
+
+/// FileBegin → Data* → FileDone of file `i`, written to its partial file.
+fn receive_one(
+    st: Progress,
+    p: Plan,
+    i: int,
+    entry: protocol.Entry,
+    start: int
+) -> Result<(Progress, bytes), string> {
+    let final_path = p.finals[i];
+    let tmp = partial_path(final_path);
+    let (l1, begin) = protocol.expect(st.link, i, protocol.KIND_FILE_BEGIN)?;
+    if (begin.len() != 4 || protocol.read_be32(begin) != i) {
+        return Result.Err("FileBegin out of order (expected file ${i})");
+    }
+    var s = st;
+    s.link = l1;
+    if (p.confined) {
+        fs.mkdir(paths.parent(final_path))?;
+        check_confined(p, final_path)?;
+    }
+    // The offer was checked against this length; it must still be there to append to.
+    if (start > 0 && partial_size(tmp)? != start) {
+        return Result.Err("${tmp} changed during the transfer");
+    }
+    let fh = fs.open(tmp, if (start > 0) { "a" } else { "w" })?;
+    let hh = match (streamhash.init()) {
+        Result.Err(e) => {
+            let _ = close(fh);
+            return Result.Err(e);
+        },
+        Result.Ok(h) => h,
+    };
+    let fed = if (start > 0) {
+        streamhash.feed(tmp, start, protocol.DEFAULT_CHUNK, hh)
+    } else {
+        Result.Ok(0)
+    };
+    let outcome = match (fed) {
+        Result.Err(e) => Result.Err(Fail { msg: e, discard: false }),
+        Result.Ok(_) => pump(s, i, entry, start, fh, hh),
+    };
+    let _ = close(fh);
+    match (outcome) {
+        Result.Ok(pair) => Result.Ok(pair),
+        Result.Err(f) => {
+            let _ = streamhash.digest(hh);
+            if (f.discard) {
+                let _ = fs.remove_file(tmp);
+            }
+            Result.Err(f.msg)
+        },
+    }
+}
+
+/// Receiver side of an authenticated session. Each file is written to its partial file
+/// and verified (SHA-256 + size, fsync) as it completes; only when SessionDone checks out
+/// are the partials renamed into place. On a transport failure every partial is KEPT,
+/// complete ones included, so the next session resends only what is missing; a file that
+/// fails its integrity check loses its partial.
+pub fn receive_files(
     c: framing.Conn,
     key: bytes,
     hello: protocol.Hello,
-    out_path: string,
+    out: string,
     resume: bool
 ) -> Result<Received, string> {
-    let tmp = partial_path(out_path);
-    let fresh = match (streamhash.init()) {
-        Result.Err(e) => {
-            return Result.Err(e);
-        },
-        Result.Ok(h) => h,
-    };
-    let offer = match (offer_from(tmp, hello.size, resume, fresh)) {
-        Result.Err(e) => {
-            let _ = streamhash.digest(fresh);
-            return Result.Err(e);
-        },
-        Result.Ok(r) => r,
-    };
-    let c1 = match (protocol.send_sealed(
-        c,
-        key,
-        protocol.FROM_RECEIVER,
-        0,
-        hello.name,
-        hello.size,
-        protocol.KIND_RESUME,
-        protocol.encode_resume(offer)
-    )) {
-        Result.Err(e) => {
-            return Result.Err(e);
-        },
-        Result.Ok(c1) => c1,
-    };
-    let start_frame = match (protocol.recv_chunk(c1, key, 0, hello.name, hello.size)) {
-        Result.Err(e) => {
-            return Result.Err(e);
-        },
-        Result.Ok(ch) => ch,
-    };
-    if (start_frame.kind != protocol.KIND_START) {
-        return Result.Err("expected a start frame, got kind " + to_string(start_frame.kind));
+    let l0 = protocol.link(c, key, protocol.FROM_RECEIVER, hello.total_size);
+    let (l1, mblob) = protocol.recv_blob(l0, protocol.KIND_MANIFEST)?;
+    let entries = protocol.decode_manifest(mblob, hello)?;
+    let n = entries.len();
+    let p = plan(entries, out);
+    var offers: [protocol.Held] = [];
+    var i = 0;
+    while (i < n) {
+        check_confined(p, p.finals[i])?;
+        offers.push(offer_for(partial_path(p.finals[i]), entries[i].size, resume)?);
+        i = i + 1;
     }
-    let start = match (protocol.decode_start(start_frame.body)) {
-        Result.Err(e) => {
-            return Result.Err(e);
-        },
-        Result.Ok(n) => n,
-    };
-    // The sender either takes the whole offer or starts over; anything else would splice
-    // bytes we do not have.
-    if (start != 0 && start != offer.offset) {
-        return Result.Err(
-            "sender wants to start at "
-                + to_string(start)
-                + " but "
-                + to_string(offer.offset)
-                + " bytes are held"
-        );
+    let l2 = protocol.send_blob(l1, protocol.KIND_RESUME, protocol.encode_resume(offers))?;
+    let (l3, sblob) = protocol.recv_blob(l2, protocol.KIND_START)?;
+    let starts = protocol.decode_starts(sblob, n)?;
+    var resumed = 0;
+    i = 0;
+    while (i < n) {
+        // The sender either takes the whole offer or starts over; anything else would
+        // splice bytes this side does not have.
+        if (starts[i] != 0 && starts[i] != offers[i].offset) {
+            return Result.Err(
+                "sender wants ${entries[i].path} from byte ${starts[i]}, but ${offers[i].offset} are held"
+            );
+        }
+        resumed = resumed + starts[i];
+        i = i + 1;
     }
-    let hh = if (start == 0 && offer.offset > 0) {
-        match (streamhash.restart(fresh)) {
+    if (resumed > 0) {
+        eprint("resuming at " + progress.format_bytes(resumed));
+    }
+
+    let session = streamhash.init()?;
+    var st = Progress {
+        link: l3,
+        meter: progress.start_from("receiving", hello.total_size, resumed),
+        done: resumed
+    };
+    i = 0;
+    while (i < n) {
+        st.meter.label = send.label("receiving", i, n, entries[i].path);
+        match (receive_one(st, p, i, entries[i], starts[i])) {
             Result.Err(e) => {
-                return Result.Err(e);
+                let _ = streamhash.digest(session);
+                return Result.Err(e + kept_hint(p));
             },
-            Result.Ok(h) => h,
+            Result.Ok(pair) => {
+                let (next, digest) = pair;
+                st = next;
+                streamhash.update(session, digest)?;
+            },
         }
-    } else {
-        fresh
-    };
-    if (start > 0) {
-        eprint("resuming at " + progress.format_bytes(start));
+        i = i + 1;
     }
-    // Keep one write handle open for the whole transfer: chunks go straight to it with
-    // fs.write_bytes (raylang M115.1) instead of reopening the file per chunk, and fs.sync
-    // before the rename makes the saved file durable across a power loss, not just a crash.
-    let fh = match (fs.open(tmp, if (start > 0) { "a" } else { "w" })) {
+    let (l4, body) = match (protocol.expect(st.link, protocol.NO_FILE, protocol.KIND_SESSION_DONE)) {
         Result.Err(e) => {
-            return Result.Err(e);
+            let _ = streamhash.digest(session);
+            return Result.Err(e + kept_hint(p));
         },
-        Result.Ok(h) => h,
+        Result.Ok(pair) => pair,
     };
-    var closed = false;
-    // Only a failed integrity check condemns the partial file; any other failure leaves
-    // authenticated bytes behind that the next transfer can build on.
-    var discard = false;
-
-    var conn = start_frame.conn;
-    var index = 1;
-    var written = start;
-    var err = "";
-    var meter = progress.start_from("receiving", hello.size, start);
-
-    while (err.len() == 0) {
-        match (protocol.recv_chunk(conn, key, index, hello.name, hello.size)) {
-            Result.Err(e) => {
-                err = e;
-            },
-            Result.Ok(ch) => {
-                conn = ch.conn;
-                if (ch.kind == protocol.KIND_DATA) {
-                    if (written + ch.body.len() > hello.size) {
-                        err = "sender sent more than the announced "
-                            + to_string(hello.size)
-                            + " bytes";
-                        discard = true;
-                    } else {
-                        match (fs.write_bytes(fh, ch.body)) {
-                            Result.Err(e) => {
-                                err = e;
-                            },
-                            Result.Ok(_) => {
-                                match (streamhash.update(hh, ch.body)) {
-                                    Result.Err(e) => {
-                                        err = e;
-                                    },
-                                    Result.Ok(_) => {
-                                        written = written + ch.body.len();
-                                        index = index + 1;
-                                        meter = progress.tick(meter, written);
-                                    },
-                                }
-                            },
-                        }
-                    }
-                } else if (ch.kind == protocol.KIND_DONE) {
-                    match (streamhash.digest(hh)) {
-                        Result.Err(e) => {
-                            err = e;
-                        },
-                        Result.Ok(digest) => {
-                            if (digest != ch.body) {
-                                err = "checksum mismatch";
-                                discard = true;
-                            } else if (written != hello.size) {
-                                err = "unexpected size: " + to_string(written);
-                                discard = true;
-                            } else {
-                                // Durable then atomic: fsync the bytes, close, then rename into place.
-                                match (fs.sync(fh)) {
-                                    Result.Err(e) => {
-                                        err = e;
-                                    },
-                                    Result.Ok(_) => {
-                                        let _ = close(fh);
-                                        closed = true;
-                                        match (fs.rename(tmp, out_path)) {
-                                            Result.Err(e) => {
-                                                err = e;
-                                            },
-                                            Result.Ok(_) => {
-                                                match (framing.write_frame(conn, b"OK")) {
-                                                    Result.Err(e) => {
-                                                        err = e;
-                                                    },
-                                                    Result.Ok(_) => {
-                                                        progress.finish(meter);
-                                                        break;
-                                                    },
-                                                }
-                                            },
-                                        }
-                                    },
-                                }
-                            }
-                        },
-                    }
-                } else {
-                    err = "unknown chunk type: " + to_string(ch.kind);
-                }
-            },
-        }
+    let (count, want) = protocol.decode_index_digest(body)?;
+    let got = streamhash.digest(session)?;
+    if (count != n || got != want) {
+        return Result.Err("session digest mismatch");
     }
-
-    if (err.len() > 0) {
-        if (!closed) {
-            let _ = close(fh);
-        }
-        if (discard) {
-            let _ = fs.remove_file(tmp);
-        }
-        Result.Err(err)
+    for f in p.finals {
+        fs.rename(partial_path(f), f)?;
+    }
+    framing.write_frame(l4.conn, b"OK")?;
+    st.meter.label = "receiving";
+    progress.finish(st.meter);
+    let dest = if (n == 1) {
+        p.finals[0]
     } else {
-        Result.Ok(Received { offset: start, size: written })
+        to_string(n) + " files in " + p.base + "/"
+    };
+    Result.Ok(Received { files: n, total: hello.total_size, resumed: resumed, dest: dest })
+}
+
+/// The note appended to a failure when partial files were left for a resume.
+fn kept_hint(p: Plan) -> string {
+    var kept = 0;
+    for f in p.finals {
+        if (fs.exists(partial_path(f))) {
+            kept = kept + 1;
+        }
     }
+    if (kept == 0) {
+        return "";
+    }
+    "\n"
+        + to_string(kept)
+        + " partial file(s) kept (*.takeit.partial): receive the same files again to resume"
 }

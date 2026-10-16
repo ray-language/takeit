@@ -1,257 +1,186 @@
-# Protocolo takeit v4 — varios archivos
+# Protocolo takeit v4 — uno o más archivos, con reanudación
 
-Diseño de frames para transferir **uno o más archivos** en una sola sesión E2E.
-Complementa `PLAN.md`. **Aún no implementado**; este doc es el contrato antes de codear.
+Contrato del protocolo que implementa takeit **0.2.0** (`src/protocol.ray`). Una sesión E2E
+transfiere un lote de N ≥ 1 archivos; un solo archivo es el caso N = 1, con la misma máquina de
+estados. Complementa [`PLAN.md`](PLAN.md).
 
-> **Nota (2026-08):** `version = 2` ya está tomada por un incremento acotado del
-> protocolo de un archivo, que solo cambió el hash de integridad al SHA-256 real
-> (hasher incremental de raylang, M126) en lugar del encadenado de v1.
->
-> **Nota (2026-10):** `version = 3` la tomó la **reanudación** del protocolo de un
-> archivo (frames `Resume`/`Start` tras el auth y nonces separados por dirección; ver
-> `PLAN.md` § Reanudación). Por eso este diseño multi-archivo usa **`version = 4`**, y
-> debe conservar esos dos frames y el tag de dirección del nonce.
-
-
-## Objetivos
-
-- Misma contraseña y un solo `host:port` (o relay futuro) para N archivos.
-- Streaming por archivo (sin cargar todo en RAM).
-- Progreso global + archivo actual.
-- Compatibilidad: un peer v1/v2/v3 solo habla su propia versión; este diseño usa `version = 4`.
+> **Historia de versiones.** v1: un archivo, hash encadenado. v2 (0.1.0): un archivo, SHA-256
+> real (hasher incremental de raylang, M126). v3: reanudación de un archivo; **nunca se
+> publicó** — se integró en v4 antes de cortar 0.2.0. v4: este documento. Un peer de otra
+> versión se rechaza en el hello con un error que nombra ambas versiones; no hay camino legacy.
 
 ## Decisiones
 
-| Tema | Elección v4 |
-|------|-------------|
+| Tema | Elección |
+|------|----------|
 | Unidad de sesión | Una conexión = un lote de archivos |
-| Manifiesto | Tras auth, **cifrado** (nombres no van en claro en la red) |
-| Hello en claro | Solo: magic, versión, salt, `file_count`, `total_size`, `chunk_size` |
-| Orden | Secuencial (archivo 0…N−1); sin multiplexar en paralelo |
-| Error en un archivo | **Abortar la sesión** entera (parciales se borran) |
-| Rutas | Relativas POSIX (`dir/a.txt`); rechazar `..`, absolutas y `\` |
-| Destino receptor | Directorio (`--out DIR`); si es un solo archivo, se permite fichero como hoy |
-| Hash por archivo | SHA-256 real del plaintext (hasher incremental M126) |
-| Contador AEAD | Un solo contador monótono de frames cifrados en toda la sesión |
-| KDF | Sin cambio: `hmac_sha256(sha256(password), salt ‖ "takeit-v1")` |
+| Hello en claro | Solo magic, versión, salt, `file_count`, `total_size`, `chunk_size`: **ningún nombre** |
+| Manifiesto | Tras el auth, **cifrado** |
+| Orden | Secuencial (archivo 0…N−1), sin multiplexar |
+| Reanudación | Por archivo: el receptor ofrece lo que ya tiene de cada entrada; el emisor decide el offset |
+| Visibilidad en destino | Nada aparece en su sitio hasta que la sesión entera se verifica; entonces se renombran todos |
+| Rutas | Relativas POSIX (`dir/a.txt`); se rechazan `..`, `.`, componentes vacíos, absolutas, `\` y NUL |
+| Destino | Directorio (`--out DIR`, o el actual); un lote de **un** archivo plano puede nombrar el archivo destino |
+| Integridad | SHA-256 por archivo (completo, también al reanudar) + SHA-256 de sesión sobre los digests |
+| Contadores AEAD | Uno por dirección, desde 0 |
+| KDF | `hmac_sha256(sha256(password), salt ‖ "takeit-v1")` (sin cambio desde v1) |
 
-## Transporte (sin cambio)
+## Transporte
 
-Cada mensaje de aplicación es un frame:
-
-```text
-u32 BE length ‖ payload
-```
-
-`length` = tamaño de `payload` (no incluye los 4 octetos). Límite: `MAX_FRAME` (≥ `chunk_size` + overhead AEAD).
+Cada mensaje es un frame `u32 BE length ‖ payload` (`length` no incluye sus 4 octetos). Un frame
+de más de `MAX_FRAME` = 262 400 B se rechaza.
 
 ## Secuencia
 
 ```text
-Sender                         Receiver
-   |                              |
-   |-------- Hello (claro) ------>|
-   |-------- Auth challenge ----->|
-   |<------- Auth response -------|
-   |-------- Manifest (AEAD) ---->|
-   |                              |
-   |  for file i in 0 .. N-1:     |
-   |-------- FileBegin (AEAD) --->|
-   |-------- Data (AEAD)* ------->|
-   |-------- FileDone (AEAD) ---->|
-   |                              |
-   |-------- SessionDone (AEAD) ->|
-   |<------- SessionACK ----------|
+Sender                                Receiver
+   |-------- Hello (claro) ------------->|
+   |-------- Auth challenge (claro) ---->|
+   |<------- Auth response (claro) ------|
+   |-------- Manifest (blob) ----------->|   S#0…
+   |<------- Resume (blob) --------------|   R#0…
+   |-------- Start (blob) -------------->|
+   |  por cada archivo i en 0 … N−1:     |
+   |-------- FileBegin(i) -------------->|
+   |-------- Data(i)* ------------------>|   solo lo que falta de i
+   |-------- FileDone(i) --------------->|
+   |-------- SessionDone --------------->|
+   |<------- "OK" (claro) ---------------|
 ```
-
-Un solo archivo es el caso N=1 (misma máquina de estados).
-
-## Tipos de frame (byte 0 del plaintext cifrado)
-
-Tras el auth, **todo** el payload útil viaja dentro de AEAD. El plaintext de cada frame cifrado empieza por un `kind: u8`:
-
-| `kind` | Nombre | Cuándo |
-|--------|--------|--------|
-| `0x10` | Manifest | Una vez, tras auth |
-| `0x11` | FileBegin | Antes de los datos de cada archivo |
-| `0x01` | Data | Trozo de plaintext del archivo actual |
-| `0x12` | FileDone | Tras el último Data del archivo |
-| `0x13` | SessionDone | Tras el último FileDone |
-| `0x02` | Done (legacy v1/v2) | No se usa en v4 |
-
-Los frames **en claro** (antes/durante auth) no usan `kind` AEAD:
-
-| Fase | Payload |
-|------|---------|
-| Hello | ver abajo |
-| Auth challenge | 16 B nonce |
-| Auth response | 32 B HMAC |
-| SessionACK | literal `OK` (o futuro `ERR` + motivo) — **en claro** tras SessionDone, o cifrado; v4: **en claro** `OK` como v1/v2 |
 
 ## Hello (claro)
 
 ```text
 magic        4 B   "TAKE"
-version      1 B   = 2
+version      1 B   = 4
 salt        16 B
-file_count   4 B   u32 BE   (≥ 1)
-total_size   8 B   u64 BE   (suma de tamaños)
-chunk_size   4 B   u32 BE
+file_count   4 B   u32 BE   1 … 100 000
+total_size   8 B   u64 BE   suma de los tamaños
+chunk_size   4 B   u32 BE   1 … 262 144
 ```
 
-Notas:
+## Auth (claro, igual que v1)
 
-- No incluye nombres (privacidad / simplicidad del hello).
-- El receptor puede rechazar si `file_count` o `total_size` exceden límites locales (futuro: flags CLI).
+1. Emisor → nonce de 16 B.
+2. Receptor → `hmac_sha256(key, "auth" ‖ nonce)`.
+3. El emisor compara en tiempo constante; si falla, cierra.
 
-## Auth (igual que v1)
+## Frames cifrados
 
-1. Sender → nonce 16 B (frame).
-2. Ambos: `mac = hmac_sha256(key, "auth" ‖ nonce)`.
-3. Receiver → `mac` (frame).
-4. Sender verifica; si falla → cierre.
+- ChaCha20-Poly1305 con la `key` de 32 B.
+- **Nonce** (12 B) = `u64 BE frame_index ‖ u32 BE dir`, con `dir` = 0 para los frames del
+  emisor y 1 para los del receptor. Ambos cifran con la misma clave; el tag de dirección hace
+  disjuntos sus espacios de nonces. `frame_index` cuenta por dirección desde 0.
+- **AAD** = `u64 BE frame_index ‖ u32 BE file_index ‖ u64 BE total_size`, con
+  `file_index = 0xFFFFFFFF` en los frames que no son de un archivo (blobs, SessionDone). Un
+  frame no se puede reordenar, mover a otro archivo ni a otra sesión.
+- **Plaintext** = `kind: u8 ‖ body`.
 
-## Frames cifrados (AEAD)
+| `kind` | Nombre | Dirección | `file_index` en AAD |
+|--------|--------|-----------|---------------------|
+| `0x10` | Manifest | S → R | ninguno |
+| `0x14` | Resume | R → S | ninguno |
+| `0x15` | Start | S → R | ninguno |
+| `0x11` | FileBegin | S → R | i |
+| `0x01` | Data | S → R | i |
+| `0x12` | FileDone | S → R | i |
+| `0x13` | SessionDone | S → R | ninguno |
 
-### Parámetros comunes
+### Blobs (Manifest, Resume, Start)
 
-- Algoritmo: ChaCha20-Poly1305.
-- `key`: 32 B (KDF).
-- `nonce`: 12 B = `u64 BE frame_index ‖ 0x00000000`.
-- `frame_index`: empieza en **0** en el primer frame cifrado (Manifest) y sube en cada seal/open.
-- `aad` (asociado):
+Pueden pasar de un frame (100 000 entradas), así que viajan troceados: el primer frame lleva
+`u64 BE longitud ‖ primer trozo`, los siguientes del mismo `kind` el resto, en trozos de hasta
+256 KiB. Longitud máxima: 128 MiB.
+
+### Manifest
 
 ```text
-u8  kind
-u64 BE frame_index
-u32 BE file_index     // 0xFFFFFFFF si no aplica (Manifest, SessionDone)
-u64 BE total_size     // del Hello
+u32  entry_count            // = file_count del Hello
+repetir entry_count:
+  u32   path_len            // ≤ 1024
+  bytes path                // UTF-8, relativa
+  u64   size
 ```
 
-Así un frame no se puede reordenar ni reutilizar entre archivos.
+El receptor lo **valida antes de tocar el disco**: número de entradas = `file_count`, suma de
+tamaños = `total_size`, cada ruta segura (`paths.check`) y única.
 
-### `0x10` Manifest
-
-Plaintext:
+### Resume
 
 ```text
-u8   0x10
-u32  entry_count      // = file_count del Hello
-// repeat entry_count:
-  u32  path_len
-  bytes path          // UTF-8, relativa
-  u64  size
+u32  entry_count
+repetir: u64 offset ‖ 32 B sha256(primeros offset bytes)
 ```
 
-Reglas de `path`:
+Por cada entrada, lo que el receptor tiene en `<destino>.takeit.partial`: su longitud si es ≤
+`size` (si no, o con `--fresh`, `0` y el SHA-256 vacío).
 
-- Separador `/`; sin prefijo `/`; sin `..` como componente; sin `\` ni NUL.
-- Única en el manifiesto (case-sensitive).
-- Longitud total del path ≤ 1024 B; `entry_count` ≤ 100_000 (límite soft).
-
-El receptor crea el directorio base y, al escribir, `join(out_dir, path)` tras validar.
-
-### `0x11` FileBegin
+### Start
 
 ```text
-u8   0x11
-u32  file_index       // 0 .. N-1, en orden
-u32  path_len
-bytes path            // debe coincidir con manifiesto[file_index]
-u64  size             // idem
+u32  entry_count
+repetir: u64 offset
 ```
 
-### `0x01` Data
+Por cada entrada, el emisor hashea los primeros `offset` bytes de **su** archivo: si coinciden con
+la oferta, envía desde ahí; si no (otro archivo con el mismo nombre, una cola rota), `0`. El
+receptor acepta solo `0` o exactamente su oferta.
 
-```text
-u8    0x01
-bytes chunk           // 1 .. chunk_size (último puede ser menor; size 0 solo si archivo vacío sin Data)
-```
+### FileBegin · Data · FileDone
 
-- Archivo vacío: FileBegin → FileDone **sin** Data.
-- Suma de lengths de Data de ese `file_index` = `size`.
+- FileBegin: `u32 file_index` (eco, en orden).
+- Data: `bytes` (1 … chunk_size). La suma por archivo es `size − offset`. Un archivo vacío o ya
+  completo va FileBegin → FileDone sin Data.
+- FileDone: `u32 file_index ‖ 32 B sha256(archivo completo)`. Ambos lados alimentan su hasher
+  con el prefijo reanudado antes de la cola. El receptor verifica digest y tamaño y hace
+  `fs.sync`; el archivo **sigue como parcial**.
 
-### `0x12` FileDone
+### SessionDone
 
-```text
-u8    0x12
-u32   file_index
-bytes digest          // 32 B: SHA-256 (incremental, M126) del plaintext de ese archivo
-```
+`u32 file_count ‖ 32 B sha256(digest_0 ‖ … ‖ digest_N−1)`. Si cuadra, el receptor renombra
+todos los parciales a su destino y responde `OK` en claro.
 
-Tras verificar digest y tamaño, el receptor hace rename atómico del `.takeit.partial` al path final.
+## Destino y confinamiento (receptor)
 
-### `0x13` SessionDone
+- Un lote de un archivo sin `/` en la ruta, con `--out` que no es un directorio existente ni
+  acaba en `/`: `--out` es el archivo destino (como v1/v2).
+- En cualquier otro caso `--out` (o `.`) es el directorio base: cada entrada va a
+  `base/path`, creando los directorios intermedios.
+- Antes de ofrecer y otra vez tras crear los directorios, el padre de cada destino tiene que
+  resolver **dentro** de la base (`fs.is_within_real`): un enlace simbólico dentro de la carpeta
+  de salida que apunte fuera no sirve para escribir fuera.
+- Un parcial que no es un archivo regular (un enlace plantado donde iría) se rechaza, nunca se
+  escribe a través de él.
 
-```text
-u8    0x13
-u32   file_count      // eco del Hello (sanity check)
-bytes session_digest  // 32 B: SHA-256 (incremental) sobre la concatenación de digests de cada FileDone
-                      //   h = init()
-                      //   for d in file_digests: h = update(h, d)
-```
+## Fallos y limpieza
 
-### SessionACK
+| Fallo | Qué queda en el receptor |
+|-------|--------------------------|
+| Red, timeout, emisor cerrado, AEAD de un frame | **todos** los parciales, completos incluidos: la siguiente sesión envía solo lo que falta |
+| Digest o tamaño de un archivo | ese parcial se borra; los demás se quedan |
+| Manifiesto inválido, ruta fuera de la base | nada se ha escrito |
 
-Frame en claro, payload `OK` (2 B). Si el receptor abortó antes, cierra sin ACK.
+Los archivos finales solo aparecen tras SessionDone, así que una sesión cortada nunca deja un
+lote a medias mezclado con archivos «buenos».
 
-## Abort y limpieza
+## Emisor: entradas
 
-Si falla auth, AEAD, path inválido, checksum o I/O:
-
-1. Receptor borra todos los `*.takeit.partial` de la sesión y archivos ya renombrados de **esta** sesión (lista en memoria).
-2. Cierra el socket.
-3. Emisor reporta error al fallar write/read o al no recibir ACK.
-
-No hay reanudación (resume) en v4.
-
-## UX CLI (propuesta)
-
-```text
-takeit send ./a.pdf ./fotos/ ./b.zip
-→ Password: …
-→ Waiting on 0.0.0.0:7421 …
-→ (3 files, 1.2 GiB)
-
-takeit recv --host H --port P --password X --out ./inbox
-→ receiving 2/3  fotos/img.jpg  …
-→ Saved: ./inbox/ (3 files, 1.2 GiB)
-```
-
-- Argumentos que son directorios: se expanden a archivos regulares (no seguir symlinks por defecto).
-- Un solo path archivo + `--out file` sigue permitido (como v1).
-- Varios archivos → `--out` debe ser directorio (o se crea).
+- Un argumento archivo va con su nombre; un directorio, recursivamente bajo **su** nombre
+  (`fotos/2026/a.jpg`), como `scp -r`. Los nombres salen de la ruta real (`.` → el nombre del
+  directorio).
+- Un argumento que es un enlace simbólico se sigue; los enlaces dentro de directorios se
+  omiten (se avisa en stderr).
+- Dos entradas que llegarían con la misma ruta son un error, igual que un nombre que no pasa
+  `paths.check` (p. ej. con `\`).
+- Si un archivo cambia de tamaño entre el manifiesto y su envío, la sesión aborta.
 
 ## Progreso
 
-- Contadores: `bytes_done / total_size`, más `file_index+1 / file_count` y path actual en la línea de progreso.
-- Labels en inglés (`sending` / `receiving`), según la convención del proyecto.
+Una línea en stderr sobre `total_size`: `sending 2/205 data/big2.bin  140 MiB / 300 MiB (46%) …`.
+El prefijo reanudado cuenta en el porcentaje, no en la velocidad ni en el ETA.
 
-## Migración desde v1/v2
+## Fuera de alcance
 
-| Peer A | Peer B | Resultado |
-|--------|--------|-----------|
-| v1 o v2 | igual | Sin cambio (protocolos ya enviados: v1 encadenado, v2 SHA-256 de un archivo) |
-| v4 | v4 | Este documento |
-| v4 send | v1/v2 recv | el receptor ve `version=3` → error "unsupported version" |
-| v1/v2 send | v4 recv | v4 puede **aceptar el hello legacy** (camino de un archivo) o rechazar; **recomendación**: v4 recv acepta v2 |
-
-Implementación sugerida: `protocol.ray` con `VERSION = 3` y rama para el hello legacy de un archivo en el receptor.
-
-## Fuera de alcance v4
-
-- Relay / códigos cortos (fase 6 del plan).
-- Compresión, delta, resume.
-- Envío en paralelo de varios archivos.
-- Metadatos extendidos (mtime, modos Unix).
-
-## Checklist de implementación
-
-- [ ] Codificar/decodificar Hello v4 + Manifest
-- [ ] Validación de paths
-- [ ] Bucle FileBegin → Data* → FileDone
-- [ ] SessionDone + session_digest
-- [ ] Expansión de directorios en CLI
-- [ ] Progreso multi-archivo
-- [ ] Tests: 1 archivo, N archivos, vacío, path traversal rechazado, abort a mitad
-- [ ] Recv compatible con Hello v1 (opcional pero recomendado)
+- Relay / códigos cortos / NAT (fase 6 del plan).
+- Compresión, delta por bloques, envío en paralelo.
+- Metadatos (mtime, permisos) y directorios vacíos.

@@ -1,0 +1,108 @@
+// Expansión de las entradas de `takeit send`: nombres en el manifiesto, recursión,
+// enlaces simbólicos y colisiones.
+import std/fs;
+import sources;
+
+fn temp_dir() -> string {
+    match (fs.make_temp_dir("takeit_sources_")) {
+        Result.Ok(d) => d,
+        Result.Err(e) => panic(e),
+    }
+}
+
+fn touch(path: string, size: int) {
+    match (fs.write_file_bytes(path, "z".repeat(size).to_bytes())) {
+        Result.Err(e) => panic(e),
+        Result.Ok(_) => { },
+    }
+}
+
+fn mkdir(path: string) {
+    match (fs.mkdir(path)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(_) => { },
+    }
+}
+
+fn wire_paths(c: sources.Collected) -> [string] {
+    c.sources.map(fn(s: sources.Source) -> string { s.entry.path })
+}
+
+@test
+fn a_directory_goes_under_its_own_name_recursively() {
+    let dir = temp_dir();
+    mkdir(dir + "/fotos/2026");
+    touch(dir + "/fotos/b.jpg", 3);
+    touch(dir + "/fotos/a.jpg", 2);
+    touch(dir + "/fotos/2026/c.jpg", 1);
+    touch(dir + "/notes.txt", 5);
+    match (sources.collect([dir + "/fotos", dir + "/notes.txt"])) {
+        Result.Err(e) => panic(e),
+        Result.Ok(c) => {
+            assert_eq(
+                wire_paths(c).join(","),
+                "fotos/2026/c.jpg,fotos/a.jpg,fotos/b.jpg,notes.txt"
+            );
+            assert_eq(sources.total_size(c.sources), 11);
+            assert_eq(c.skipped.len(), 0);
+        },
+    }
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn the_current_directory_goes_by_its_real_name() {
+    let dir = temp_dir();
+    mkdir(dir + "/proj");
+    touch(dir + "/proj/x", 1);
+    match (sources.collect([dir + "/proj/."])) {
+        Result.Err(e) => panic(e),
+        Result.Ok(c) => assert_eq(wire_paths(c).join(","), "proj/x"),
+    }
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn symlinks_inside_directories_are_skipped_but_an_argument_symlink_is_followed() {
+    let dir = temp_dir();
+    mkdir(dir + "/d");
+    touch(dir + "/real.txt", 4);
+    touch(dir + "/d/kept.txt", 1);
+    match (fs.symlink(dir + "/real.txt", dir + "/d/link.txt")) {
+        Result.Err(e) => panic(e),
+        Result.Ok(_) => { },
+    }
+    match (sources.collect([dir + "/d", dir + "/d/link.txt"])) {
+        Result.Err(e) => panic(e),
+        Result.Ok(c) => {
+            // The argument symlink resolves to real.txt and goes by that name.
+            assert_eq(wire_paths(c).join(","), "d/kept.txt,real.txt");
+            assert_eq(c.skipped.len(), 1);
+            assert(c.skipped[0].ends_with("/d/link.txt"));
+        },
+    }
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn two_inputs_with_the_same_name_are_an_error() {
+    let dir = temp_dir();
+    mkdir(dir + "/a");
+    mkdir(dir + "/b");
+    touch(dir + "/a/x.txt", 1);
+    touch(dir + "/b/x.txt", 1);
+    match (sources.collect([dir + "/a/x.txt", dir + "/b/x.txt"])) {
+        Result.Ok(_) => panic("a name collision must be refused"),
+        Result.Err(e) => assert(e.contains("would both arrive as x.txt")),
+    }
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn nothing_to_send_is_an_error() {
+    let dir = temp_dir();
+    mkdir(dir + "/empty");
+    assert(sources.collect([dir + "/empty"]).is_err());
+    assert(sources.collect([dir + "/missing"]).is_err());
+    let _ = fs.remove_all(dir);
+}
