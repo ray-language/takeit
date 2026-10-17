@@ -2,11 +2,9 @@
 # supported platform and uploads it to that tag's GitHub Release.
 #
 # The raylang toolchain is the release pinned in ray.toml (`raylang = "X.Y.Z"`),
-# downloaded prebuilt for each runner's target from ray-language/raylang's Releases:
-# CI tests and builds with exactly the `ray` the project was validated against, not
-# whatever raylang's main happens to be. takeit has no path deps, so the project
-# only needs `ray` on PATH (plus cargo for `--native`, which fetches the ray-runtime
-# crates on the first build).
+# downloaded prebuilt for each runner's target (.github/actions/setup-ray, shared with
+# ci.yml): releases are tested and built with exactly the `ray` the project was
+# validated against, not whatever raylang's main happens to be.
 #
 # Every platform compiles NATIVELY on its own runner. `ray build --release` adds
 # `-C target-cpu=native` unless `--target` is given, which would produce binaries
@@ -82,65 +80,10 @@ jobs:
       - name: Check out takeit
         uses: actions/checkout@v4
 
-      # Every step runs under bash, Git Bash on Windows, so the scripts are shared.
-      - name: Install Rust stable + target
-        shell: bash
-        run: |
-          if ! command -v rustup >/dev/null 2>&1; then
-            # Not every Windows ARM image ships rustup.
-            curl -sSfL --retry 3 -o "$RUNNER_TEMP/rustup-init.exe" https://win.rustup.rs/aarch64
-            "$RUNNER_TEMP/rustup-init.exe" -y --profile minimal --default-toolchain none
-            echo "$USERPROFILE/.cargo/bin" >>"$GITHUB_PATH"
-            export PATH="$USERPROFILE/.cargo/bin:$PATH"
-          fi
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          rustup target add ${{ matrix.target }}
-
-      - name: Install the pinned raylang release
-        shell: bash
-        run: |
-          version="$(sed -n 's/^raylang *= *"\(.*\)"/\1/p' ray.toml | head -1)"
-          if [ -z "$version" ]; then
-            echo "::error::ray.toml does not pin a raylang version"
-            exit 1
-          fi
-          # raylang ships a .zip for Windows and a .tar.gz everywhere else.
-          ext="${{ matrix.pack }}"
-          url="https://github.com/ray-language/raylang/releases/download/v$version/raylang-${{ matrix.target }}.$ext"
-          echo "raylang $version from $url"
-          dir="$RUNNER_TEMP/raylang"
-          mkdir -p "$dir"
-          if [ "$ext" = "zip" ]; then
-            curl -sSfL --retry 3 -o "$RUNNER_TEMP/raylang.zip" "$url"
-            powershell -NoProfile -Command "Expand-Archive -Path '$RUNNER_TEMP/raylang.zip' -DestinationPath '$dir'"
-          else
-            curl -sSfL --retry 3 "$url" | tar xz -C "$dir"
-          fi
-          if ! "$dir/ray" version | tr -d '\r' | grep -qxF "raylang $version"; then
-            echo "::error::downloaded ray reports '$("$dir/ray" version | head -1)', expected raylang $version"
-            exit 1
-          fi
-          echo "$dir" >>"$GITHUB_PATH"
-          echo "RAYLANG_VERSION=$version" >>"$GITHUB_ENV"
-
-      # The native build compiles the ray-runtime crates; cache them per raylang release.
-      - name: Cache the native build's crates
-        uses: actions/cache@v4
+      - name: Set up Rust and the pinned raylang
+        uses: ./.github/actions/setup-ray
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ray-native-${{ matrix.target }}-${{ env.RAYLANG_VERSION }}
-          restore-keys: ray-native-${{ matrix.target }}-
-
-      # Informational: it exits 1 when anything optional (extra targets, the offline
-      # vendor) is missing, which the build below does not need.
-      - name: ray toolchain status
-        shell: bash
-        run: |
-          ray version
-          ray toolchain status || true
+          target: ${{ matrix.target }}
 
       - name: Run the test suite
         shell: bash
