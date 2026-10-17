@@ -1,20 +1,23 @@
-# Protocolo takeit v4 — uno o más archivos, con reanudación
+# Protocolo takeit v5 — uno o más archivos, con reanudación y PAKE
 
-Contrato del protocolo que implementa takeit desde **0.2.0** (`src/protocol.ray`). Una sesión E2E
+Contrato del protocolo que implementa takeit desde **0.4.0** (`src/protocol.ray`). Una sesión E2E
 transfiere un lote de N ≥ 1 archivos; un solo archivo es el caso N = 1, con la misma máquina de
 estados. Complementa [`PLAN.md`](PLAN.md).
 
 > **Historia de versiones.** v1: un archivo, hash encadenado. v2 (0.1.0): un archivo, SHA-256
 > real (hasher incremental de raylang, M126). v3: reanudación de un archivo; **nunca se
-> publicó** — se integró en v4 antes de cortar 0.2.0. v4: este documento. Un peer de otra
-> versión se rechaza en el hello con un error que nombra ambas versiones; no hay camino legacy.
+> publicó** — se integró en v4 antes de cortar 0.2.0. v4 (0.2.0–0.3.0): lotes y reanudación,
+> clave `hmac_sha256(sha256(password), salt)`. v5: este documento — lo mismo que v4 tras el
+> handshake, que pasa a ser CPace. Un peer de otra versión se rechaza en el hello con un error
+> que nombra ambas versiones; no hay camino legacy.
 
 ## Decisiones
 
 | Tema | Elección |
 |------|----------|
 | Unidad de sesión | Una conexión = un lote de archivos |
-| Hello en claro | Solo magic, versión, salt, `file_count`, `total_size`, `chunk_size`: **ningún nombre** |
+| Hello en claro | Solo magic, versión, `sid`, `file_count`, `total_size`, `chunk_size`: **ningún nombre** |
+| Autenticación | PAKE **CPace** (CPACE-X25519-SHA512) con confirmación de clave en ambos sentidos |
 | Manifiesto | Tras el auth, **cifrado** |
 | Orden | Secuencial (archivo 0…N−1), sin multiplexar |
 | Reanudación | Por archivo: el receptor ofrece lo que ya tiene de cada entrada; el emisor decide el offset |
@@ -23,7 +26,7 @@ estados. Complementa [`PLAN.md`](PLAN.md).
 | Destino | Directorio (`--out DIR`, o el actual); un lote de **un** archivo plano puede nombrar el archivo destino |
 | Integridad | SHA-256 por archivo (completo, también al reanudar) + SHA-256 de sesión sobre los digests |
 | Contadores AEAD | Uno por dirección, desde 0 |
-| KDF | `hmac_sha256(sha256(password), salt ‖ "takeit-v1")` (sin cambio desde v1) |
+| Clave de sesión | `hkdf_sha256(salt = sid, ikm = ISK, info = "takeit-v5 session key")`, 32 B |
 
 ## Transporte
 
@@ -35,8 +38,9 @@ de más de `MAX_FRAME` = 262 400 B se rechaza.
 ```text
 Sender                                Receiver
    |-------- Hello (claro) ------------->|
-   |-------- Auth challenge (claro) ---->|
-   |<------- Auth response (claro) ------|
+   |-------- Ya (claro) ---------------->|
+   |<------- Yb ‖ Tb (claro) ------------|
+   |-------- Ta (claro) ---------------->|
    |-------- Manifest (blob) ----------->|   S#0…
    |<------- Resume (blob) --------------|   R#0…
    |-------- Start (blob) -------------->|
@@ -53,17 +57,47 @@ Sender                                Receiver
 ```text
 magic        4 B   "TAKE"
 version      1 B   = 4
-salt        16 B
+sid         16 B   aleatorio, nuevo en cada sesión
 file_count   4 B   u32 BE   1 … 100 000
 total_size   8 B   u64 BE   suma de los tamaños
 chunk_size   4 B   u32 BE   1 … 262 144
 ```
 
-## Auth (claro, igual que v1)
+## Autenticación: CPace
 
-1. Emisor → nonce de 16 B.
-2. Receptor → `hmac_sha256(key, "auth" ‖ nonce)`.
-3. El emisor compara en tiempo constante; si falla, cierra.
+[CPace](https://datatracker.ietf.org/doc/draft-irtf-cfrg-cpace/) (borrador 21 de la CFRG),
+suite CPACE-X25519-SHA512, en modo iniciador/respondedor: el emisor es A y el receptor es B
+(`src/cpace.ray`, con los vectores de prueba del borrador).
+
+| Entrada CPace | Valor en takeit |
+|---------------|-----------------|
+| PRS | la contraseña normalizada (`password.normalize`: sin guiones ni espacios, minúsculas), UTF-8 |
+| CI | `b"takeit"` |
+| sid | el `sid` del hello |
+| ADa | los bytes exactos del hello: si alguien lo altera en tránsito, la autenticación falla |
+| ADb | vacío |
+
+1. Ambos calculan el generador `g = Elligator2(SHA-512(generator_string(PRS, CI, sid)))` y
+   eligen un escalar aleatorio nuevo.
+2. Emisor → `Ya` (32 B).
+3. Receptor: `K = X25519(yb, Ya)` (aborta si `Ya` es de orden bajo), `ISK`, y responde
+   `Yb ‖ Tb` (32 + 64 B), con `Tb = HMAC-SHA512(mac_key, lv_cat(Yb, ADb))` y
+   `mac_key = SHA-512("CPaceMac" ‖ sid ‖ ISK)`.
+4. Emisor: `K = X25519(ya, Yb)`, comprueba `Tb` en tiempo constante; si no cuadra, cierra
+   («wrong password?»). Si cuadra, envía `Ta = HMAC-SHA512(mac_key, lv_cat(Ya, ADa))`.
+5. Receptor: comprueba `Ta`; si no cuadra o el emisor colgó, aborta.
+
+Ambos derivan la clave de sesión de `ISK` con HKDF. Qué cambia frente a v4:
+
+- **Escuchar la red no sirve para adivinar la contraseña.** En v4, el reto y su HMAC bastaban
+  para probar contraseñas offline; en v5 nada de lo que pasa por el cable se puede comprobar
+  sin resolver un Diffie-Hellman.
+- **Un atacante activo tiene un intento por sesión**, y el emisor solo acepta una conexión.
+- **Secreto hacia adelante**: cada sesión usa escalares nuevos; la contraseña filtrada después
+  no descifra una sesión grabada.
+- Limitación conocida: el mapeo Elligator2 usa `std/bigint`, que no es de tiempo constante, así
+  que su duración depende de la contraseña. Es un cálculo por sesión; el riesgo práctico es
+  para un atacante con medidas de tiempo finas sobre la máquina.
 
 ## Frames cifrados
 

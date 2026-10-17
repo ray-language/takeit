@@ -5,7 +5,6 @@ import std/crypto;
 import framing;
 import protocol;
 import password;
-import kdf;
 import progress;
 import streamhash;
 import paths;
@@ -37,10 +36,10 @@ pub fn run(opts: RecvOpts) -> int {
         Result.Err(e) => Result.Err(e),
         Result.Ok(pair) => {
             let (c1, hello) = pair;
-            let key = kdf.derive_key(password.normalize(opts.password), hello.salt);
-            match (protocol.auth_as_receiver(c1, key)) {
+            match (protocol.auth_as_receiver(c1, password.normalize(opts.password), hello)) {
                 Result.Err(e) => Result.Err(e),
-                Result.Ok(c2) => {
+                Result.Ok(pair) => {
+                    let (c2, key) = pair;
                     let what = if (hello.file_count == 1) {
                         "1 file"
                     } else {

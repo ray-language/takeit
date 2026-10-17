@@ -1,0 +1,336 @@
+// CPace (draft-irtf-cfrg-cpace-21), suite CPACE-X25519-SHA512, initiator/responder setting.
+// A balanced PAKE: both sides turn the password into a curve generator and run a
+// Diffie-Hellman exchange on it, so a wiretap learns nothing it can test passwords
+// against offline, and an active attacker gets one guess per session.
+//
+// The generator is Elligator 2 over GF(2^255 - 19), written with std/bigint. bigint is
+// not constant-time: computing the generator leaks timing that depends on the password.
+// One computation per session over the network is a weak channel, but it is a known
+// limitation (the draft's side-channel section asks for constant-time code here).
+import std/crypto;
+import std/bigint;
+import std/hex;
+
+/// G_X25519.DSI.
+const DSI: bytes = b"CPace255";
+
+/// SHA-512 input block size (H.s_in_bytes).
+const HASH_BLOCK: int = 128;
+
+/// Curve25519 Montgomery coefficient A.
+const CURVE_A: int = 486662;
+
+/// `prepend_len`: the LEB128 length of `data`, then `data`.
+pub fn prepend_len(data: bytes) -> bytes {
+    var n = data.len();
+    var len: [int] = [];
+    while (true) {
+        if (n < 128) {
+            len.push(n);
+        } else {
+            len.push((n & 127) + 128);
+        }
+        n = n / 128;
+        if (n == 0) {
+            break;
+        }
+    }
+    bytes_of(len) + data
+}
+
+/// `lv_cat`: each part with its length prepended.
+pub fn lv_cat(parts: [bytes]) -> bytes {
+    bytes_concat(parts.map(prepend_len))
+}
+
+fn zero_bytes(n: int) -> bytes {
+    var z: [int] = [];
+    for _ in 0..n {
+        z.push(0);
+    }
+    bytes_of(z)
+}
+
+/// `generator_string(DSI, PRS, CI, sid, s_in_bytes)`.
+pub fn generator_string(prs: bytes, ci: bytes, sid: bytes) -> bytes {
+    let used = 1 + prepend_len(prs).len() + prepend_len(DSI).len();
+    let zpad = if (HASH_BLOCK > used) { HASH_BLOCK - used } else { 0 };
+    lv_cat([DSI, prs, zero_bytes(zpad), ci, sid])
+}
+
+fn field_prime() -> bytes {
+    // 2^255 - 19
+    let p = bigint.shl(bigint.from_int(1), 255).unwrap();
+    bigint.sub(p, bigint.from_int(19)).unwrap()
+}
+
+/// Little-endian 32 bytes → big-endian bigint, with bit 255 cleared (decodeUCoordinate).
+fn decode_u(le: bytes) -> bytes {
+    var be: [int] = [];
+    var i = 31;
+    while (i >= 0) {
+        be.push(if (i == 31) { le[i] & 127 } else { le[i] });
+        i = i - 1;
+    }
+    bigint.from_bytes(bytes_of(be))
+}
+
+/// bigint (< 2^256) → 32 little-endian bytes (encodeUCoordinate).
+fn encode_u(n: bytes) -> bytes {
+    let be = bigint.from_bytes(n);
+    var le: [int] = [];
+    var i = be.len() - 1;
+    while (i >= 0) {
+        le.push(be[i]);
+        i = i - 1;
+    }
+    while (le.len() < 32) {
+        le.push(0);
+    }
+    bytes_of(le)
+}
+
+fn fmod(a: bytes, q: bytes) -> Result<bytes, string> {
+    bigint.rem(a, q)
+}
+
+fn fadd(a: bytes, b: bytes, q: bytes) -> Result<bytes, string> {
+    fmod(bigint.add(a, b)?, q)
+}
+
+fn fmul(a: bytes, b: bytes, q: bytes) -> Result<bytes, string> {
+    fmod(bigint.mul(a, b)?, q)
+}
+
+/// `-a mod q`.
+fn fneg(a: bytes, q: bytes) -> Result<bytes, string> {
+    let r = fmod(a, q)?;
+    if (bigint.is_zero(r)) {
+        return Result.Ok(r);
+    }
+    bigint.sub(q, r)
+}
+
+/// Elligator 2 on Curve25519 with the non-square Z = 2: a field element → the
+/// u-coordinate of a curve point (the draft's appendix A.5).
+fn elligator2(r: bytes) -> Result<bytes, string> {
+    let q = field_prime();
+    let a = bigint.from_int(CURVE_A);
+    let one = bigint.from_int(1);
+    // v = -A / (1 + 2 r^2). The denominator is never 0: -1/2 is a non-square here.
+    let den = fadd(one, fmul(bigint.from_int(2), fmul(r, r, q)?, q)?, q)?;
+    let v = fmul(fneg(a, q)?, bigint.modinv(den, q)?, q)?;
+    // epsilon = legendre(v^3 + A v^2 + v): 1 when v is on the curve, q - 1 when not.
+    let v2 = fmul(v, v, q)?;
+    let rhs = fadd(fadd(fmul(v2, v, q)?, fmul(a, v2, q)?, q)?, v, q)?;
+    let half = bigint.shr(bigint.sub(q, one)?, 1)?;
+    let eps = bigint.modpow(rhs, half, q)?;
+    if (bigint.cmp(eps, one) == 0) {
+        Result.Ok(v)
+    } else {
+        // x = -v - A
+        fneg(fadd(v, a, q)?, q)
+    }
+}
+
+/// `G.calculate_generator(H, PRS, CI, sid)`: the password-bound generator g.
+pub fn generator(prs: bytes, ci: bytes, sid: bytes) -> Result<bytes, string> {
+    let h = crypto.sha512(generator_string(prs, ci, sid)).sub_bytes(0, 32);
+    Result.Ok(encode_u(elligator2(decode_u(h))?))
+}
+
+/// `G.scalar_mult_vfy(y, g)`: X25519, or an error for a low-order point (the neutral
+/// element, on which both sides MUST abort).
+pub fn scalar_mult(y: bytes, g: bytes) -> Result<bytes, string> {
+    match (crypto.x25519_shared_secret(y, g)) {
+        Option.None => Result.Err("invalid CPace share (low-order point)"),
+        Option.Some(k) => {
+            if (k == zero_bytes(32)) {
+                Result.Err("invalid CPace share (low-order point)")
+            } else {
+                Result.Ok(k)
+            }
+        },
+    }
+}
+
+/// `G.sample_scalar()`.
+pub fn sample_scalar() -> bytes {
+    crypto.random_bytes(32)
+}
+
+/// `transcript_ir(Ya, ADa, Yb, ADb)`.
+pub fn transcript(ya: bytes, ada: bytes, yb: bytes, adb: bytes) -> bytes {
+    lv_cat([ya, ada]) + lv_cat([yb, adb])
+}
+
+/// `ISK = H.hash(lv_cat(DSI ‖ "_ISK", sid, K) ‖ transcript_ir(Ya, ADa, Yb, ADb))`.
+pub fn isk(sid: bytes, k: bytes, ya: bytes, ada: bytes, yb: bytes, adb: bytes) -> bytes {
+    crypto.sha512(lv_cat([DSI + b"_ISK", sid, k]) + transcript(ya, ada, yb, adb))
+}
+
+/// Key confirmation (section 10.4): `mac_key = H.hash("CPaceMac" ‖ sid ‖ ISK)`.
+pub fn mac_key(sid: bytes, isk_value: bytes) -> bytes {
+    crypto.sha512(b"CPaceMac" + sid + isk_value)
+}
+
+/// The tag a party sends over its own message: `MAC(mac_key, lv_cat(Y, AD))`.
+pub fn tag(mac: bytes, y: bytes, ad: bytes) -> bytes {
+    crypto.hmac_sha512(mac, lv_cat([y, ad]))
+}
+
+// Test vectors: draft-irtf-cfrg-cpace-21, appendices A and B.1.
+
+fn h(s: string) -> bytes {
+    hex.hex_decode(s).unwrap()
+}
+
+fn tv_ci() -> bytes {
+    h("0b415f696e69746961746f720b425f726573706f6e646572")
+}
+
+fn tv_sid() -> bytes {
+    h("7e4b4791d6a8ef019b936c79fb7f2c57")
+}
+
+@test
+fn string_utilities_match_the_draft() {
+    assert_eq(hex.hex_encode(prepend_len(b"")), "00");
+    assert_eq(hex.hex_encode(prepend_len(b"1234")), "0431323334");
+    var r: [int] = [];
+    for i in 0..128 {
+        r.push(i);
+    }
+    assert_eq(hex.hex_encode(prepend_len(bytes_of(r)).sub_bytes(0, 3)), "800100");
+    assert_eq(hex.hex_encode(lv_cat([b"1234", b"5", b"", b"678"])), "043132333401350003363738");
+    assert_eq(
+        hex.hex_encode(transcript(b"123", b"PartyA", b"234", b"PartyB")),
+        "03313233065061727479410332333406506172747942"
+    );
+}
+
+@test
+fn generator_matches_the_draft() {
+    let gs = generator_string(b"Password", tv_ci(), tv_sid());
+    assert_eq(gs.len(), 170);
+    assert_eq(
+        hex.hex_encode(crypto.sha512(gs).sub_bytes(0, 32)),
+        "03998087bdb1a2617bbe25ef5a7c18cd4f84f902328701790958755ee4aed1d3"
+    );
+    assert_eq(
+        hex.hex_encode(generator(b"Password", tv_ci(), tv_sid()).unwrap()),
+        "d04bf6d41f6a289632a2e929fa29bebd51092512a7829fdde7d314b62f05a73f"
+    );
+}
+
+@test
+fn exchange_and_isk_match_the_draft() {
+    let g = generator(b"Password", tv_ci(), tv_sid()).unwrap();
+    let ya = h("21b4f4bd9e64ed355c3eb676a28ebedaf6d8f17bdc365995b319097153044080");
+    let yb = h("848b0779ff415f0af4ea14df9dd1d3c29ac41d836c7808896c4eba19c51ac40a");
+    let big_ya = scalar_mult(ya, g).unwrap();
+    let big_yb = scalar_mult(yb, g).unwrap();
+    assert_eq(
+        hex.hex_encode(big_ya),
+        "1d13c89278cdadd826f6d8d7f887701430f8380ddc17611cdd6dc989ce0c9f32"
+    );
+    assert_eq(
+        hex.hex_encode(big_yb),
+        "248cccf6d5cdc3646f0ad593f9e6cef4e69d4945f8372e623512ecea32185623"
+    );
+    let ka = scalar_mult(ya, big_yb).unwrap();
+    let kb = scalar_mult(yb, big_ya).unwrap();
+    assert_eq(ka, kb);
+    assert_eq(
+        hex.hex_encode(ka),
+        "5b067effbdc0b2a0e1d907b21ebb25cfedb96a852179a847c37e43ee71322c6b"
+    );
+    assert_eq(
+        hex.hex_encode(isk(tv_sid(), ka, big_ya, b"ADa", big_yb, b"ADb")),
+        "6e19b875f7a561d6b3ca3dbb9ef42ac55de3e717881018204b8922b4d5e53bb2"
+            + "aa82c300bea7b65d2b671da71922ddf6472301b79bc270adfa8bf413285f2263"
+    );
+}
+
+/// Draft B.1.10: u0..u5 and u7 encode low-order points (on the curve or its twist, some
+/// only once bit 255 is cleared) and MUST abort; u6, u8..ub give the listed results.
+@test
+fn low_order_points_are_refused() {
+    let s = h("af46e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449aff");
+    let refused = [
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+        "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+        "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"
+    ];
+    for u in refused {
+        assert(scalar_mult(s, h(u)).is_err());
+    }
+    let accepted = [
+        (
+            "daffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "d8e2c776bbacd510d09fd9278b7edcd25fc5ae9adfba3b6e040e8d3b71b21806"
+        ),
+        (
+            "dbffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "c85c655ebe8be44ba9c0ffde69f2fe10194458d137f09bbff725ce58803cdb38"
+        ),
+        (
+            "d9ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "db64dafa9b8fdd136914e61461935fe92aa372cb056314e1231bc4ec12417456"
+        ),
+        (
+            "cdeb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b880",
+            "e062dcd5376d58297be2618c7498f55baa07d7e03184e8aada20bca28888bf7a"
+        ),
+        (
+            "4c9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f11d7",
+            "993c6ad11c4c29da9a56f7691fd0ff8d732e49de6250b6c2e80003ff4629a175"
+        )
+    ];
+    for (u, q) in accepted {
+        assert_eq(hex.hex_encode(scalar_mult(s, h(u)).unwrap()), q);
+    }
+}
+
+/// Both branches of the map land ON the curve (u^3 + A u^2 + u is a square), never on
+/// the twist: X25519 accepts twist points too, so a wrong branch would go unnoticed.
+@test
+fn every_generator_is_on_the_curve() {
+    let q = field_prime();
+    let a = bigint.from_int(CURVE_A);
+    let half = bigint.shr(bigint.sub(q, bigint.from_int(1)).unwrap(), 1).unwrap();
+    var branches: Map<string, bool> = Map.new();
+    for i in 0..64 {
+        let sid = crypto.sha256(bytes_of([i])).sub_bytes(0, 16);
+        let u = decode_u(generator(b"pw", b"", sid).unwrap());
+        let u2 = fmul(u, u, q).unwrap();
+        let rhs = fadd(
+            fadd(fmul(u2, u, q).unwrap(), fmul(a, u2, q).unwrap(), q).unwrap(),
+            u,
+            q
+        ).unwrap();
+        assert(bigint.cmp(bigint.modpow(rhs, half, q).unwrap(), bigint.from_int(1)) == 0);
+        // Which branch elligator2 took: v itself is on the curve or not.
+        let r = decode_u(crypto.sha512(generator_string(b"pw", b"", sid)).sub_bytes(0, 32));
+        let den = fadd(
+            bigint.from_int(1),
+            fmul(bigint.from_int(2), fmul(r, r, q).unwrap(), q).unwrap(),
+            q
+        ).unwrap();
+        let v = fmul(fneg(a, q).unwrap(), bigint.modinv(den, q).unwrap(), q).unwrap();
+        branches.insert(if (bigint.cmp(u, v) == 0) { "v" } else { "-v-A" }, true);
+    }
+    assert(branches.contains_key("v"));
+    assert(branches.contains_key("-v-A"));
+}
+
+@test
+fn a_different_password_gives_a_different_generator() {
+    let a = generator(b"Password", tv_ci(), tv_sid()).unwrap();
+    let b = generator(b"Passwore", tv_ci(), tv_sid()).unwrap();
+    assert(a != b);
+}

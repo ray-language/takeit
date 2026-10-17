@@ -2,7 +2,7 @@
 
 Transferencia de archivos **peer-to-peer** con cifrado de extremo a extremo, escrita en [raylang](https://github.com/ray-language/raylang).
 
-**Versión actual: `0.3.0` (protocolo v4).** Un equipo envía archivos o carpetas; el otro recibe. No hay cuenta, no hay servidor en la nube, no hay intermediario que vea el contenido: solo TCP, una contraseña de un solo uso y AEAD (ChaCha20-Poly1305).
+**Versión actual: `0.4.0` (protocolo v5).** Un equipo envía archivos o carpetas; el otro recibe. No hay cuenta, no hay servidor en la nube, no hay intermediario que vea el contenido: solo TCP, una contraseña de un solo uso, un PAKE (CPace) y AEAD (ChaCha20-Poly1305).
 
 ```text
 # Emisor
@@ -34,7 +34,7 @@ Comparte la contraseña por un canal aparte (chat, voz, SMS). Quien no la tenga 
 | Capacidad | Estado |
 |-----------|--------|
 | `send` / `recv` de **uno o más archivos y carpetas** por sesión | ✅ listo |
-| Cifrado E2E (ChaCha20-Poly1305) + auth por contraseña | ✅ listo |
+| Cifrado E2E (ChaCha20-Poly1305) + auth por contraseña con PAKE (CPace): sin ataques offline | ✅ listo |
 | Streaming (chunks 256 KiB, sin cargar el archivo en RAM) | ✅ listo |
 | Hash de integridad SHA-256 (incremental, M126) + ACK final | ✅ listo |
 | Barra de progreso en stderr (`sending` / `receiving`) | ✅ listo |
@@ -53,7 +53,7 @@ Detalle del protocolo y roadmap: [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Por qué takeit
 
-- **E2E de verdad** — la clave se deriva de la contraseña + un salt público; el contenido viaja cifrado con ChaCha20-Poly1305.
+- **E2E de verdad** — la clave de sesión sale de un PAKE (CPace) sobre la contraseña: quien escuche la red no puede ni descifrar ni probar contraseñas offline; el contenido viaja cifrado con ChaCha20-Poly1305.
 - **Streaming** — el archivo no se carga entero en RAM; se lee y escribe por trozos (256 KiB) con hash de integridad SHA-256 (incremental).
 - **UX mínima** — genera la contraseña, escucha, muestra el comando exacto del receptor y una barra de progreso en stderr.
 - **Un solo binario** — sin runtime, sin deps externas; compilado a código nativo con `ray build --native`.
@@ -147,15 +147,15 @@ Saved: ./informe.pdf (300.0 MiB, resumed at 88.7 MiB)
 ## Seguridad (resumen)
 
 1. Contraseña de 8 bytes CSPRNG, mostrada como `xxxx-xxxx-xxxx-xxxx`.
-2. Salt de 16 B en el handshake en claro.
-3. KDF: `hmac_sha256(sha256(password), salt ‖ "takeit-v1")` → clave de 32 B.
+2. Handshake **CPace** (CPACE-X25519-SHA512, borrador CFRG) sobre la contraseña, con confirmación de clave en ambos sentidos: lo que viaja por el cable no permite probar contraseñas offline, un atacante activo tiene un solo intento por sesión, y cada sesión tiene claves nuevas (secreto hacia adelante).
+3. Clave de sesión: HKDF-SHA256 del ISK de CPace → 32 B. El hello forma parte de la transcripción: alterarlo en tránsito hace fallar la autenticación.
 4. Chunks AEAD; un fallo de autenticación aborta (contraseña mala o manipulación).
-5. El hello en claro no lleva nombres: el manifiesto (rutas y tamaños) va cifrado. Magic `TAKE`, versión de protocolo `4`.
+5. El hello en claro no lleva nombres: el manifiesto (rutas y tamaños) va cifrado. Magic `TAKE`, versión de protocolo `5`.
 6. SHA-256 de cada archivo completo (hasher incremental de raylang, M126, también al reanudar) y de la sesión.
 7. El receptor rechaza rutas absolutas, con `..` o que resuelvan fuera de `--out` (enlaces simbólicos incluidos).
 8. Emisor y receptor cifran con la misma clave, cada uno en su propio espacio de nonces (tag de dirección).
 
-Protocolo completo: [`docs/PROTOCOL_V4.md`](docs/PROTOCOL_V4.md).
+Protocolo completo: [`docs/PROTOCOL_V5.md`](docs/PROTOCOL_V5.md). Un takeit 0.2/0.3 (v4) y un 0.4 no se entienden: el más antiguo pide actualizar.
 
 ## Arquitectura
 
@@ -163,7 +163,7 @@ Protocolo completo: [`docs/PROTOCOL_V4.md`](docs/PROTOCOL_V4.md).
 src/
 ├── main.ray          # CLI: send | recv
 ├── password.ray      # generar / normalizar contraseña
-├── kdf.ray           # password + salt → key 32 B
+├── cpace.ray         # PAKE CPace (X25519 + Elligator2), con los vectores del borrador
 ├── framing.ray       # frames u32 BE + buffer de sobrante
 ├── protocol.ray      # hello, manifiesto, resume/start, frames AEAD, blobs
 ├── paths.ray         # validación de rutas del manifiesto

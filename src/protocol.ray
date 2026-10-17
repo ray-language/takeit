@@ -1,19 +1,30 @@
-// Protocolo takeit v4: uno o más archivos por sesión, con reanudación por archivo.
+// Protocolo takeit v5: uno o más archivos por sesión, con reanudación por archivo.
 // v2 (raylang M126): el hash de integridad es el SHA-256 real del texto plano.
 // v3 (nunca publicado): reanudación de un archivo con nonces separados por dirección.
 // v4: hello sin nombres; tras el auth todo va cifrado — manifiesto, oferta de
 // reanudación del receptor, offsets del emisor y, por archivo, FileBegin → Data* →
-// FileDone; cierra SessionDone con el SHA-256 de los digests. Detalle: docs/PROTOCOL_V4.md.
+// FileDone; cierra SessionDone con el SHA-256 de los digests.
+// v5: la clave sale de un PAKE (CPace) en vez de hmac(sha256(password), salt), así que
+// escuchar la sesión ya no permite probar contraseñas offline. Detalle: docs/PROTOCOL_V5.md.
 // Wire incompatible: peers de versiones distintas se rechazan en el hello.
 import std/crypto;
 import std/math;
 import framing;
-import kdf;
+import cpace;
 import paths;
 
-pub const VERSION: int = 4;
+pub const VERSION: int = 5;
 
-pub const SALT_LEN: int = 16;
+/// The session id: random, public, sent by the sender in the hello.
+pub const SID_LEN: int = 16;
+
+/// CPace channel identifier: binds the exchange to this application.
+const CPACE_CI: bytes = b"takeit";
+
+/// A CPace share (an X25519 u-coordinate) and a key-confirmation tag (HMAC-SHA512).
+const SHARE_LEN: int = 32;
+
+const TAG_LEN: int = 64;
 
 /// 256 KiB: fewer AEAD frames and better throughput on large files.
 pub const DEFAULT_CHUNK: int = 262144;
@@ -56,7 +67,7 @@ pub const FROM_SENDER: int = 0;
 pub const FROM_RECEIVER: int = 1;
 
 pub struct Hello {
-    salt: bytes,
+    sid: bytes,
     file_count: int,
     total_size: int,
     chunk_size: int,
@@ -144,7 +155,7 @@ fn finished(r: Reader) -> Result<int, string> {
 pub fn encode_hello(h: Hello) -> bytes {
     MAGIC
         + bytes_of([VERSION])
-        + h.salt
+        + h.sid
         + be32(h.file_count)
         + be64(h.total_size)
         + be32(h.chunk_size)
@@ -161,7 +172,7 @@ pub fn decode_hello(payload: bytes) -> Result<Hello, string> {
         );
     }
     let r0 = Reader { data: payload, off: 5 };
-    let (r1, salt) = take(r0, SALT_LEN)?;
+    let (r1, sid) = take(r0, SID_LEN)?;
     let (r2, count) = take32(r1)?;
     let (r3, total) = take64(r2)?;
     let (r4, chunk) = take32(r3)?;
@@ -172,7 +183,7 @@ pub fn decode_hello(payload: bytes) -> Result<Hello, string> {
     if (chunk < 1 || chunk > DEFAULT_CHUNK) {
         return Result.Err("invalid chunk size in hello: ${chunk}");
     }
-    Result.Ok(Hello { salt: salt, file_count: count, total_size: total, chunk_size: chunk })
+    Result.Ok(Hello { sid: sid, file_count: count, total_size: total, chunk_size: chunk })
 }
 
 pub fn encode_manifest(entries: [Entry]) -> bytes {
@@ -424,30 +435,93 @@ pub fn recv_hello(c: framing.Conn) -> Result<(framing.Conn, Hello), string> {
     Result.Ok((c2, h))
 }
 
-/// Sender: sends a nonce and verifies the receiver's HMAC response.
-pub fn auth_as_sender(c: framing.Conn, key: bytes) -> Result<framing.Conn, string> {
-    let nonce = crypto.random_bytes(16);
-    let c1 = framing.write_frame(c, nonce)?;
-    let (c2, resp) = framing.read_frame(c1, 64)?;
-    let expect_mac = crypto.hmac_sha256(key, b"auth" + nonce);
-    if (!crypto.constant_time_eq(resp, expect_mac)) {
+/// The CPace state one side holds after computing its share.
+struct Share {
+    scalar: bytes,
+    point: bytes,
+}
+
+fn own_share(secret: string, sid: bytes) -> Result<Share, string> {
+    let g = cpace.generator(secret.to_bytes(), CPACE_CI, sid)?;
+    let y = cpace.sample_scalar();
+    Result.Ok(Share { scalar: y, point: cpace.scalar_mult(y, g)? })
+}
+
+/// The ChaCha20-Poly1305 key for the rest of the session, from CPace's ISK.
+fn session_key(sid: bytes, isk: bytes) -> Result<bytes, string> {
+    match (crypto.hkdf_sha256(sid, isk, b"takeit-v5 session key", 32)) {
+        Option.None => Result.Err("could not derive the session key"),
+        Option.Some(k) => Result.Ok(k),
+    }
+}
+
+/// Sender (CPace initiator A, ADa = the hello it sent): sends Ya, checks the receiver's
+/// confirmation tag, sends its own. Returns the session key.
+pub fn auth_as_sender(
+    c: framing.Conn,
+    secret: string,
+    hello: Hello
+) -> Result<(framing.Conn, bytes), string> {
+    let ada = encode_hello(hello);
+    let mine = own_share(secret, hello.sid)?;
+    let c1 = framing.write_frame(c, mine.point)?;
+    let (c2, reply) = match (framing.read_frame(c1, SHARE_LEN + TAG_LEN)) {
+        // A receiver of another protocol version reads the hello, says so and hangs up.
+        Result.Err(e) => return Result.Err(
+            "the receiver hung up before authenticating (${e}); an older takeit tells its user to update"
+        ),
+        Result.Ok(pair) => pair,
+    };
+    if (reply.len() != SHARE_LEN + TAG_LEN) {
+        return Result.Err("malformed authentication reply");
+    }
+    let yb = reply.sub_bytes(0, SHARE_LEN);
+    let k = cpace.scalar_mult(mine.scalar, yb)?;
+    let isk = cpace.isk(hello.sid, k, mine.point, ada, yb, b"");
+    let mac = cpace.mac_key(hello.sid, isk);
+    let tb = reply.sub_bytes(SHARE_LEN, SHARE_LEN + TAG_LEN);
+    if (!crypto.constant_time_eq(tb, cpace.tag(mac, yb, b""))) {
         return Result.Err("authentication failed (wrong password?)");
     }
-    Result.Ok(c2)
+    let c3 = framing.write_frame(c2, cpace.tag(mac, mine.point, ada))?;
+    Result.Ok((c3, session_key(hello.sid, isk)?))
 }
 
-/// Receiver: reads the nonce and replies with HMAC.
-pub fn auth_as_receiver(c: framing.Conn, key: bytes) -> Result<framing.Conn, string> {
-    let (c1, nonce) = framing.read_frame(c, 64)?;
-    framing.write_frame(c1, crypto.hmac_sha256(key, b"auth" + nonce))
-}
-
-pub fn derive(password: string, salt: bytes) -> bytes {
-    kdf.derive_key(password, salt)
+/// Receiver (CPace responder B, ADb empty): reads Ya, replies Yb ‖ its tag, checks the
+/// sender's tag. Returns the session key.
+pub fn auth_as_receiver(
+    c: framing.Conn,
+    secret: string,
+    hello: Hello
+) -> Result<(framing.Conn, bytes), string> {
+    let ada = encode_hello(hello);
+    let (c1, ya) = framing.read_frame(c, SHARE_LEN)?;
+    if (ya.len() != SHARE_LEN) {
+        return Result.Err("malformed authentication share");
+    }
+    let mine = own_share(secret, hello.sid)?;
+    let k = cpace.scalar_mult(mine.scalar, ya)?;
+    let isk = cpace.isk(hello.sid, k, ya, ada, mine.point, b"");
+    let mac = cpace.mac_key(hello.sid, isk);
+    let c2 = framing.write_frame(c1, mine.point + cpace.tag(mac, mine.point, b""))?;
+    let (c3, ta) = match (framing.read_frame(c2, TAG_LEN)) {
+        // The sender hangs up when our tag does not match its password.
+        Result.Err(_) => return Result.Err("authentication failed: the sender hung up (wrong password?)"),
+        Result.Ok(pair) => pair,
+    };
+    if (!crypto.constant_time_eq(ta, cpace.tag(mac, ya, ada))) {
+        return Result.Err("authentication failed (wrong password?)");
+    }
+    Result.Ok((c3, session_key(hello.sid, isk)?))
 }
 
 fn sample_hello(count: int, total: int) -> Hello {
-    Hello { salt: crypto.random_bytes(16), file_count: count, total_size: total, chunk_size: 4096 }
+    Hello {
+        sid: crypto.random_bytes(SID_LEN),
+        file_count: count,
+        total_size: total,
+        chunk_size: 4096
+    }
 }
 
 @test
@@ -459,17 +533,18 @@ fn hello_codec() {
             assert_eq(h2.file_count, 3);
             assert_eq(h2.total_size, 1024);
             assert_eq(h2.chunk_size, 4096);
-            assert(h2.salt == h.salt);
+            assert(h2.sid == h.sid);
         },
     }
 }
 
 @test
 fn another_version_is_named_in_the_error() {
-    let old = MAGIC + bytes_of([2]) + crypto.random_bytes(40);
+    // A takeit 0.2/0.3 peer (v4) is told to update instead of failing authentication.
+    let old = MAGIC + bytes_of([4]) + crypto.random_bytes(40);
     match (decode_hello(old)) {
-        Result.Ok(_) => panic("a v2 hello must be rejected"),
-        Result.Err(e) => assert(e.contains("v2") && e.contains("v4")),
+        Result.Ok(_) => panic("a v4 hello must be rejected"),
+        Result.Err(e) => assert(e.contains("v4") && e.contains("v5")),
     }
     assert(decode_hello(b"HTTP/1.1 200").is_err());
 }
