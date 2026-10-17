@@ -1,4 +1,6 @@
-// Roundtrip localhost con streaming (SHA-256 incremental M126 + escritura a disco).
+// Sesiones completas por TCP localhost con las funciones reales de cada lado
+// (send.stream_files / recv.receive_files): uno y varios archivos, reanudación tras un
+// corte, prefijos que no valen, y manifiestos hostiles que el receptor debe rechazar.
 import std/net;
 import std/fs;
 import std/crypto;
@@ -6,224 +8,403 @@ import framing;
 import protocol;
 import password;
 import kdf;
-import streamhash;
-import fileread;
+import send;
+import recv;
+import sources;
 
-fn basename(path: string) -> string {
-    let parts = path.split("/");
-    if (parts.len() == 0) {
-        return path;
-    }
-    let last = parts[parts.len() - 1];
-    if (last.len() == 0) { path } else { last }
-}
+/// Small chunks so a few hundred bytes already span many frames.
+const CHUNK: int = 64;
 
-@test
-fn roundtrip_localhost() {
-    let payload = b"hola\x00takeit\xffmundo";
-    let dir = match (fs.make_temp_dir("takeit_roundtrip_")) {
+fn temp_dir() -> string {
+    match (fs.make_temp_dir("takeit_roundtrip_")) {
         Result.Ok(d) => d,
         Result.Err(e) => panic(e),
-    };
-    let path_in = dir + "/in.bin";
-    let path_out = dir + "/out.bin";
-    match (fs.write_file_bytes(path_in, payload)) {
+    }
+}
+
+/// Non-uniform content: a repeated or skipped chunk would show. `seed` tells files apart.
+fn sample(size: int, seed: int) -> bytes {
+    var octets: [int] = [];
+    var i = 0;
+    while (i < size) {
+        octets.push((i * 7 + i / 64 + seed * 31) % 251);
+        i = i + 1;
+    }
+    bytes_of(octets)
+}
+
+fn parent_of(path: string) -> string {
+    let parts = path.split("/");
+    parts.slice(0, parts.len() - 1).join("/")
+}
+
+fn write(path: string, data: bytes) {
+    match (fs.mkdir(parent_of(path))) {
         Result.Err(e) => panic(e),
         Result.Ok(_) => { },
     }
-
-    match (net.tcp_listen("127.0.0.1", 0)) {
+    match (fs.write_file_bytes(path, data)) {
         Result.Err(e) => panic(e),
-        Result.Ok(listener) => {
-            let port = net.local_port(listener);
-            let pw = password.generate();
-            let salt = crypto.random_bytes(protocol.SALT_LEN);
-            let key = kdf.derive_key(password.normalize(pw), salt);
-            let name = basename(path_in);
-            let size = payload.len();
-
-            let ready: Channel<int> = Channel.new();
-            let done: Channel<int> = Channel.new();
-
-            spawn(fn() {
-                match (recv(ready)) {
-                    Option.None => panic("ready cerrado"),
-                    Option.Some(_) => { },
-                }
-                match (net.tcp_connect("127.0.0.1", port)) {
-                    Result.Err(e) => panic(e),
-                    Result.Ok(sock) => {
-                        let c0 = framing.from_handle(sock);
-                        match (protocol.recv_hello(c0)) {
-                            Result.Err(e) => panic(e),
-                            Result.Ok(pair) => {
-                                let (c1, hello) = pair;
-                                assert(hello.name == name);
-                                assert(hello.size == size);
-                                let key_r = kdf.derive_key(password.normalize(pw), hello.salt);
-                                match (protocol.auth_as_receiver(c1, key_r)) {
-                                    Result.Err(e) => panic(e),
-                                    Result.Ok(c2) => {
-                                        let tmp = path_out + ".takeit.partial";
-                                        match (fs.write_file_bytes(tmp, b"")) {
-                                            Result.Err(e) => panic(e),
-                                            Result.Ok(_) => { },
-                                        }
-                                        var conn = c2;
-                                        var index = 0;
-                                        var written = 0;
-                                        let hh = match (streamhash.init()) {
-                                            Result.Err(e) => panic(e),
-                                            Result.Ok(h) => h,
-                                        };
-                                        while (true) {
-                                            match (protocol.recv_chunk(
-                                                conn,
-                                                key_r,
-                                                index,
-                                                hello.name,
-                                                hello.size
-                                            )) {
-                                                Result.Err(e) => panic(e),
-                                                Result.Ok(ch) => {
-                                                    conn = ch.conn;
-                                                    if (ch.kind == 1) {
-                                                        match (fs.append_file_bytes(tmp, ch.body)) {
-                                                            Result.Err(e) => panic(e),
-                                                            Result.Ok(_) => {
-                                                                match (streamhash.update(
-                                                                    hh,
-                                                                    ch.body
-                                                                )) {
-                                                                    Result.Err(e) => panic(e),
-                                                                    Result.Ok(_) => { },
-                                                                }
-                                                                written = written + ch.body.len();
-                                                                index = index + 1;
-                                                            },
-                                                        }
-                                                    } else if (ch.kind == 2) {
-                                                        match (streamhash.digest(hh)) {
-                                                            Result.Err(e) => panic(e),
-                                                            Result.Ok(d) => assert(d == ch.body),
-                                                        }
-                                                        assert(written == size);
-                                                        match (fs.rename(tmp, path_out)) {
-                                                            Result.Err(e) => panic(e),
-                                                            Result.Ok(_) => {
-                                                                match (framing.write_frame(
-                                                                    conn,
-                                                                    b"OK"
-                                                                )) {
-                                                                    Result.Err(e) => panic(e),
-                                                                    Result.Ok(_) => {
-                                                                        break;
-                                                                    },
-                                                                }
-                                                            },
-                                                        }
-                                                    } else {
-                                                        panic("kind");
-                                                    }
-                                                },
-                                            }
-                                        }
-                                        framing.close_conn(conn);
-                                        send(done, 1);
-                                    },
-                                }
-                            },
-                        }
-                    },
-                }
-            });
-
-            send(ready, 1);
-            match (net.tcp_accept(listener)) {
-                Result.Err(e) => panic(e),
-                Result.Ok(sock) => {
-                    close(listener);
-                    let c0 = framing.from_handle(sock);
-                    let hello = protocol.Hello {
-                        salt: salt,
-                        name: name,
-                        size: size,
-                        chunk_size: 4
-                    };
-                    match (protocol.send_hello(c0, hello)) {
-                        Result.Err(e) => panic(e),
-                        Result.Ok(c1) => match (protocol.auth_as_sender(c1, key)) {
-                            Result.Err(e) => panic(e),
-                            Result.Ok(c2) => {
-                                var conn = c2;
-                                var index = 0;
-                                let hh = match (streamhash.init()) {
-                                    Result.Err(e) => panic(e),
-                                    Result.Ok(h) => h,
-                                };
-                                match (fileread.for_each_chunk(path_in, 4, fn(piece: bytes) -> Result<int, string> {
-                                    match (protocol.send_chunk(
-                                        conn,
-                                        key,
-                                        index,
-                                        name,
-                                        size,
-                                        1,
-                                        piece
-                                    )) {
-                                        Result.Err(e) => Result.Err(e),
-                                        Result.Ok(c3) => {
-                                            conn = c3;
-                                            match (streamhash.update(hh, piece)) {
-                                                Result.Err(e) => panic(e),
-                                                Result.Ok(_) => { },
-                                            }
-                                            index = index + 1;
-                                            Result.Ok(0)
-                                        },
-                                    }
-                                })) {
-                                    Result.Err(e) => panic(e),
-                                    Result.Ok(_) => { },
-                                }
-                                let digest = match (streamhash.digest(hh)) {
-                                    Result.Err(e) => panic(e),
-                                    Result.Ok(d) => d,
-                                };
-                                match (protocol.send_chunk(
-                                    conn,
-                                    key,
-                                    index,
-                                    name,
-                                    size,
-                                    2,
-                                    digest
-                                )) {
-                                    Result.Err(e) => panic(e),
-                                    Result.Ok(c4) => match (framing.read_frame(c4, 16)) {
-                                        Result.Err(e) => panic(e),
-                                        Result.Ok(pair) => {
-                                            let (_c5, ack) = pair;
-                                            assert(ack == b"OK");
-                                            framing.close_conn(c4);
-                                        },
-                                    },
-                                }
-                            },
-                        },
-                    }
-                },
-            }
-
-            match (recv(done)) {
-                Option.Some(_) => { },
-                Option.None => panic("recv no termino"),
-            }
-            match (fs.read_file_bytes(path_out)) {
-                Result.Err(e) => panic(e),
-                Result.Ok(out) => assert(out == payload),
-            }
-            let _ = fs.remove_all(dir);
-        },
+        Result.Ok(_) => { },
     }
+}
+
+fn read(path: string) -> bytes {
+    match (fs.read_file_bytes(path)) {
+        Result.Err(e) => panic("${path}: ${e}"),
+        Result.Ok(b) => b,
+    }
+}
+
+fn mkdir(path: string) {
+    match (fs.mkdir(path)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(_) => { },
+    }
+}
+
+fn collect(args: [string]) -> [sources.Source] {
+    match (sources.collect(args)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(c) => c.sources,
+    }
+}
+
+/// What both sides of one session ended with.
+struct Session {
+    sent: Result<send.Sent, string>,
+    got: Result<recv.Received, string>,
+}
+
+/// Runs hello + auth by hand on both ends for a batch announcing `count` files and
+/// `total` bytes, then hands the authenticated connections to `serve` (the sender side)
+/// and to recv.receive_files (the receiver side, in a fiber).
+fn session_with(
+    count: int,
+    total: int,
+    out: string,
+    resume: bool,
+    serve: fn(framing.Conn, bytes) -> Result<send.Sent, string>
+) -> Session {
+    let listener = match (net.tcp_listen("127.0.0.1", 0)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(l) => l,
+    };
+    let port = net.local_port(listener);
+    let pw = password.generate();
+    let salt = crypto.random_bytes(protocol.SALT_LEN);
+    let key = kdf.derive_key(password.normalize(pw), salt);
+    let done: Channel<Result<recv.Received, string>> = Channel.new();
+
+    spawn(fn() {
+        let sock = match (net.tcp_connect("127.0.0.1", port)) {
+            Result.Err(e) => panic(e),
+            Result.Ok(s) => s,
+        };
+        let c0 = framing.from_handle(sock);
+        let got = match (protocol.recv_hello(c0)) {
+            Result.Err(e) => Result.Err(e),
+            Result.Ok(pair) => {
+                let (c1, hello) = pair;
+                let key_r = kdf.derive_key(password.normalize(pw), hello.salt);
+                match (protocol.auth_as_receiver(c1, key_r)) {
+                    Result.Err(e) => Result.Err(e),
+                    Result.Ok(c2) => recv.receive_files(c2, key_r, hello, out, resume),
+                }
+            },
+        };
+        framing.close_conn(c0);
+        send(done, got);
+    });
+
+    let sock = match (net.tcp_accept(listener)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(s) => s,
+    };
+    close(listener);
+    let c0 = framing.from_handle(sock);
+    let hello = protocol.Hello {
+        salt: salt,
+        file_count: count,
+        total_size: total,
+        chunk_size: CHUNK
+    };
+    let c1 = match (protocol.send_hello(c0, hello)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(c) => c,
+    };
+    let c2 = match (protocol.auth_as_sender(c1, key)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(c) => c,
+    };
+    let sent = serve(c2, key);
+    framing.close_conn(c2);
+    match (recv(done)) {
+        Option.None => panic("receiver fiber vanished"),
+        Option.Some(got) => Session { sent: sent, got: got },
+    }
+}
+
+/// A full session with the real sender over the expanded `args`.
+fn session(args: [string], out: string, resume: bool) -> Session {
+    let files = collect(args);
+    session_with(files.len(), sources.total_size(
+        files
+    ), out, resume, fn(c: framing.Conn, key: bytes) -> Result<send.Sent, string> {
+        send.stream_files(c, key, files, CHUNK)
+    })
+}
+
+fn expect_ok(s: Session) -> (send.Sent, recv.Received) {
+    let got = match (s.got) {
+        Result.Err(e) => panic("receiver: " + e),
+        Result.Ok(g) => g,
+    };
+    match (s.sent) {
+        Result.Err(e) => panic("sender: " + e),
+        Result.Ok(sent) => (sent, got),
+    }
+}
+
+fn expect_receiver_error(s: Session) -> string {
+    match (s.got) {
+        Result.Ok(_) => panic("the receiver should have refused"),
+        Result.Err(e) => e,
+    }
+}
+
+/// A batch on disk: `<dir>/src/{a.txt, empty.bin, fotos/x.jpg, fotos/2026/y.jpg}`.
+fn make_tree(dir: string) -> string {
+    let root = dir + "/src";
+    write(root + "/a.txt", sample(300, 1));
+    write(root + "/empty.bin", b"");
+    write(root + "/fotos/x.jpg", sample(1000, 2));
+    write(root + "/fotos/2026/y.jpg", sample(130, 3));
+    root
+}
+
+@test
+fn one_file_to_a_named_target() {
+    let dir = temp_dir();
+    let payload = sample(1000, 0);
+    write(dir + "/in.bin", payload);
+    let (sent, got) = expect_ok(session([dir + "/in.bin"], dir + "/copy.bin", true));
+    assert_eq(sent.files, 1);
+    assert_eq(sent.sent, 1000);
+    assert_eq(got.dest, dir + "/copy.bin");
+    assert(read(dir + "/copy.bin") == payload);
+    assert(!fs.exists(recv.partial_path(dir + "/copy.bin")));
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn one_file_into_an_existing_directory() {
+    let dir = temp_dir();
+    write(dir + "/in.bin", sample(200, 0));
+    mkdir(dir + "/inbox");
+    let _ = expect_ok(session([dir + "/in.bin"], dir + "/inbox", true));
+    assert(read(dir + "/inbox/in.bin") == sample(200, 0));
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn files_and_a_directory_tree_arrive_under_the_output_directory() {
+    let dir = temp_dir();
+    let root = make_tree(dir);
+    write(dir + "/loose.txt", sample(77, 9));
+    let out = dir + "/inbox";
+    let args = [root + "/fotos", dir + "/loose.txt", root + "/empty.bin"];
+    let (sent, got) = expect_ok(session(args, out, true));
+    assert_eq(sent.files, 4);
+    assert_eq(sent.total, 1000 + 130 + 77);
+    assert_eq(got.files, 4);
+    assert(read(out + "/fotos/x.jpg") == sample(1000, 2));
+    assert(read(out + "/fotos/2026/y.jpg") == sample(130, 3));
+    assert(read(out + "/loose.txt") == sample(77, 9));
+    assert_eq(read(out + "/empty.bin").len(), 0);
+    match (fs.list_dir(out + "/fotos")) {
+        Result.Err(e) => panic(e),
+        // `2026` and `x.jpg`: no partial file left behind.
+        Result.Ok(names) => assert_eq(names.len(), 2),
+    }
+    let _ = fs.remove_all(dir);
+}
+
+/// A sender that agrees to start every file from 0, sends file 0 whole, `extra` data
+/// frames of file 1 and hangs up: the interrupted batch a dropped connection leaves.
+fn cut_inside_second_file(
+    files: [sources.Source],
+    extra: int
+) -> fn(framing.Conn, bytes) -> Result<send.Sent, string> {
+    fn(c: framing.Conn, key: bytes) -> Result<send.Sent, string> {
+        let total = sources.total_size(files);
+        var l = protocol.link(c, key, protocol.FROM_SENDER, total);
+        l = protocol.send_blob(
+            l,
+            protocol.KIND_MANIFEST,
+            protocol.encode_manifest(sources.entries(files))
+        )?;
+        let (l1, _offer) = protocol.recv_blob(l, protocol.KIND_RESUME)?;
+        var zeros: [int] = [];
+        for _f in files {
+            zeros.push(0);
+        }
+        l = protocol.send_blob(l1, protocol.KIND_START, protocol.encode_starts(zeros))?;
+        let first = read(files[0].local);
+        l = protocol.seal(l, 0, protocol.KIND_FILE_BEGIN, protocol.be32(0))?;
+        l = protocol.seal(l, 0, protocol.KIND_DATA, first)?;
+        l = protocol.seal(
+            l,
+            0,
+            protocol.KIND_FILE_DONE,
+            protocol.encode_index_digest(0, crypto.sha256(first))
+        )?;
+        let second = read(files[1].local);
+        l = protocol.seal(l, 1, protocol.KIND_FILE_BEGIN, protocol.be32(1))?;
+        var k = 0;
+        while (k < extra) {
+            let piece = second.sub_bytes(k * CHUNK, (k + 1) * CHUNK);
+            l = protocol.seal(l, 1, protocol.KIND_DATA, piece)?;
+            k = k + 1;
+        }
+        Result.Err("cut on purpose")
+    }
+}
+
+@test
+fn an_interrupted_batch_resumes_with_only_what_is_missing() {
+    let dir = temp_dir();
+    let root = make_tree(dir);
+    let out = dir + "/inbox";
+    let args = [root + "/fotos"];
+    let files = collect(args);
+    // list_dir order: fotos/2026/y.jpg (130 B) before fotos/x.jpg (1000 B).
+    assert_eq(files[0].entry.path, "fotos/2026/y.jpg");
+
+    let cut = session_with(
+        files.len(),
+        sources.total_size(files),
+        out,
+        true,
+        cut_inside_second_file(files, 3)
+    );
+    let e = expect_receiver_error(cut);
+    assert(e.contains("partial file(s) kept"));
+    // Nothing is in place until the whole session checks out; both partials are kept.
+    assert(!fs.exists(out + "/fotos/2026/y.jpg"));
+    assert(!fs.exists(out + "/fotos/x.jpg"));
+    assert(read(recv.partial_path(out + "/fotos/2026/y.jpg")) == sample(130, 3));
+    let head = sample(1000, 2).sub_bytes(0, 3 * CHUNK);
+    assert(read(recv.partial_path(out + "/fotos/x.jpg")) == head);
+
+    // The next session sends only the tail of the second file.
+    let (sent, got) = expect_ok(session(args, out, true));
+    assert_eq(sent.resumed, 130 + 3 * CHUNK);
+    assert_eq(sent.sent, 1000 - 3 * CHUNK);
+    assert_eq(got.resumed, 130 + 3 * CHUNK);
+    assert(read(out + "/fotos/2026/y.jpg") == sample(130, 3));
+    assert(read(out + "/fotos/x.jpg") == sample(1000, 2));
+    assert(!fs.exists(recv.partial_path(out + "/fotos/x.jpg")));
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn a_partial_that_is_not_a_prefix_starts_over() {
+    let dir = temp_dir();
+    let payload = sample(1000, 0);
+    let out = dir + "/out.bin";
+    write(dir + "/in.bin", payload);
+    // Same length as a real prefix, different bytes (another file, a torn tail…).
+    write(recv.partial_path(out), "x".repeat(300).to_bytes());
+    let (sent, _got) = expect_ok(session([dir + "/in.bin"], out, true));
+    assert_eq(sent.resumed, 0);
+    assert_eq(sent.sent, 1000);
+    assert(read(out) == payload);
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn a_partial_longer_than_the_file_starts_over() {
+    let dir = temp_dir();
+    let out = dir + "/out.bin";
+    write(dir + "/in.bin", sample(200, 0));
+    write(recv.partial_path(out), sample(500, 0));
+    let (sent, _got) = expect_ok(session([dir + "/in.bin"], out, true));
+    assert_eq(sent.resumed, 0);
+    assert(read(out) == sample(200, 0));
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn fresh_ignores_a_valid_partial() {
+    let dir = temp_dir();
+    let payload = sample(1000, 0);
+    let out = dir + "/out.bin";
+    write(dir + "/in.bin", payload);
+    write(recv.partial_path(out), payload.sub_bytes(0, 400));
+    let (sent, _got) = expect_ok(session([dir + "/in.bin"], out, false));
+    assert_eq(sent.resumed, 0);
+    assert_eq(sent.sent, 1000);
+    assert(read(out) == payload);
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn a_complete_partial_needs_no_data() {
+    let dir = temp_dir();
+    let payload = sample(300, 0);
+    let out = dir + "/out.bin";
+    write(dir + "/in.bin", payload);
+    write(recv.partial_path(out), payload);
+    let (sent, _got) = expect_ok(session([dir + "/in.bin"], out, true));
+    assert_eq(sent.resumed, 300);
+    assert_eq(sent.sent, 0);
+    assert(read(out) == payload);
+    let _ = fs.remove_all(dir);
+}
+
+/// A sender that announces `entries` (whatever they say) and stops after the manifest.
+fn hostile(entries: [protocol.Entry]) -> fn(framing.Conn, bytes) -> Result<send.Sent, string> {
+    fn(c: framing.Conn, key: bytes) -> Result<send.Sent, string> {
+        var total = 0;
+        for e in entries {
+            total = total + e.size;
+        }
+        let l = protocol.link(c, key, protocol.FROM_SENDER, total);
+        let _ = protocol.send_blob(l, protocol.KIND_MANIFEST, protocol.encode_manifest(entries))?;
+        Result.Err("hostile sender done")
+    }
+}
+
+@test
+fn a_manifest_that_escapes_the_output_directory_is_refused() {
+    let dir = temp_dir();
+    let out = dir + "/inbox";
+    let entries = [protocol.Entry { path: "../escaped.txt", size: 4 }];
+    let e = expect_receiver_error(session_with(1, 4, out, true, hostile(entries)));
+    assert(e.contains("invalid component"));
+    assert(!fs.exists(dir + "/escaped.txt"));
+    assert(!fs.exists(out));
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn a_symlinked_directory_in_the_output_cannot_be_written_through() {
+    let dir = temp_dir();
+    let out = dir + "/inbox";
+    let outside = dir + "/outside";
+    mkdir(out);
+    mkdir(outside);
+    match (fs.symlink(outside, out + "/link")) {
+        Result.Err(e) => panic(e),
+        Result.Ok(_) => { },
+    }
+    let entries = [protocol.Entry { path: "link/x.txt", size: 4 }];
+    let e = expect_receiver_error(session_with(1, 4, out, true, hostile(entries)));
+    assert(e.contains("refusing to write outside"));
+    match (fs.list_dir(outside)) {
+        Result.Err(err) => panic(err),
+        Result.Ok(names) => assert_eq(names.len(), 0),
+    }
+    let _ = fs.remove_all(dir);
 }

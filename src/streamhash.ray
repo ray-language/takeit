@@ -4,6 +4,7 @@
 // dependía de las fronteras de los trozos. El handle es mutable: `update` lo alimenta
 // en orden y `digest` lo cierra devolviendo los 32 bytes.
 import std/crypto;
+import fileread;
 
 /// Opens a fresh incremental SHA-256 hasher.
 pub fn init() -> Result<int, string> {
@@ -18,6 +19,26 @@ pub fn update(h: int, chunk: bytes) -> Result<int, string> {
 /// Finalizes the hasher and returns the 32-byte digest.
 pub fn digest(h: int) -> Result<bytes, string> {
     crypto.hash_final(h)
+}
+
+/// Feeds the first `len` bytes of `path` into `h`: a resumed file's hash must cover the
+/// prefix the peer already has before the tail that crosses the wire.
+pub fn feed(path: string, len: int, chunk_size: int, h: int) -> Result<int, string> {
+    fileread.for_each_chunk_range(path, 0, len, chunk_size, fn(piece: bytes) -> Result<int, string> {
+        update(h, piece)
+    })
+}
+
+/// SHA-256 of the first `len` bytes of `path`.
+pub fn prefix_digest(path: string, len: int, chunk_size: int) -> Result<bytes, string> {
+    let h = init()?;
+    match (feed(path, len, chunk_size, h)) {
+        Result.Err(e) => {
+            let _ = digest(h);
+            Result.Err(e)
+        },
+        Result.Ok(_) => digest(h),
+    }
 }
 
 @test

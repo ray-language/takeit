@@ -6,14 +6,19 @@ const DEFAULT_TIMEOUT_SECS: int = 120;
 
 fn usage() {
     eprint("usage:");
-    eprint("  takeit send <file> [--bind HOST] [--port N] [--timeout SECS]");
-    eprint("  takeit recv --host HOST --port N --password PASS [--out PATH] [--timeout SECS]");
+    eprint("  takeit send <file|dir>... [--bind HOST] [--port N] [--timeout SECS]");
+    eprint(
+        "  takeit recv --host HOST --port N --password PASS [--out PATH] [--timeout SECS] [--fresh]"
+    );
     eprint("");
+    eprint("  send       files go by name, directories recursively under their own name");
+    eprint("  --out      recv: target file (one file) or directory (default: current one)");
     eprint(
         "  --timeout  idle seconds (accept/read); 0 = no limit (default "
             + to_string(DEFAULT_TIMEOUT_SECS)
             + ")"
     );
+    eprint("  --fresh    recv: ignore a partial file from an interrupted transfer (no resume)");
 }
 
 fn flag_value(av: [string], name: string) -> Option<string> {
@@ -25,6 +30,27 @@ fn flag_value(av: [string], name: string) -> Option<string> {
         i = i + 1;
     }
     Option.None
+}
+
+/// Flags that take a value: their value is not a positional argument.
+const VALUED_FLAGS: [string] = ["--bind", "--port", "--timeout", "--host", "--password", "--out"];
+
+/// The arguments from `from` on that are neither flags nor flag values.
+fn positionals(av: [string], from: int) -> [string] {
+    var out: [string] = [];
+    var i = from;
+    while (i < av.len()) {
+        let a = av[i];
+        if (VALUED_FLAGS.contains(a)) {
+            i = i + 2;
+        } else if (a.starts_with("--")) {
+            i = i + 1;
+        } else {
+            out.push(a);
+            i = i + 1;
+        }
+    }
+    out
 }
 
 fn parse_int_or(s: string, fallback: int) -> int {
@@ -52,11 +78,11 @@ fn main() -> int {
     }
     let cmd = av[0];
     if (cmd == "send") {
-        if (av.len() < 2) {
+        let inputs = positionals(av, 1);
+        if (inputs.len() == 0) {
             usage();
             return 1;
         }
-        let path = av[1];
         let bind = match (flag_value(av, "--bind")) {
             Option.Some(h) => h,
             Option.None => "0.0.0.0",
@@ -67,7 +93,7 @@ fn main() -> int {
         };
         send.run(
             send.SendOpts {
-                path: path,
+                paths: inputs,
                 bind: bind,
                 port: port,
                 timeout_ms: timeout_ms_from_args(av)
@@ -105,7 +131,8 @@ fn main() -> int {
                 port: port,
                 password: pw,
                 out: out,
-                timeout_ms: timeout_ms_from_args(av)
+                timeout_ms: timeout_ms_from_args(av),
+                resume: !av.contains("--fresh")
             }
         )
     } else if (cmd == "--help" || cmd == "-h" || cmd == "help") {

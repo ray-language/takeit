@@ -1,27 +1,77 @@
-// Protocolo takeit v2: hello, auth, chunks AEAD, done.
-// v2 (raylang M126): el hash de integridad es el SHA-256 real del texto plano
-// (hasher incremental), no el encadenado dependiente de fronteras de v1. Wire
-// incompatible: un peer v1 y uno v2 se rechazan en el hello.
+// Protocolo takeit v4: uno o más archivos por sesión, con reanudación por archivo.
+// v2 (raylang M126): el hash de integridad es el SHA-256 real del texto plano.
+// v3 (nunca publicado): reanudación de un archivo con nonces separados por dirección.
+// v4: hello sin nombres; tras el auth todo va cifrado — manifiesto, oferta de
+// reanudación del receptor, offsets del emisor y, por archivo, FileBegin → Data* →
+// FileDone; cierra SessionDone con el SHA-256 de los digests. Detalle: docs/PROTOCOL_V4.md.
+// Wire incompatible: peers de versiones distintas se rechazan en el hello.
 import std/crypto;
+import std/math;
 import framing;
 import kdf;
+import paths;
 
-pub const VERSION: int = 2;
+pub const VERSION: int = 4;
 
 pub const SALT_LEN: int = 16;
 
 /// 256 KiB: fewer AEAD frames and better throughput on large files.
 pub const DEFAULT_CHUNK: int = 262144;
 
+/// A sealed frame: kind byte + up to DEFAULT_CHUNK + 8 header bytes + 16-byte tag.
 pub const MAX_FRAME: int = 262400;
 
 pub const MAGIC: bytes = b"TAKE";
 
+/// Most files one session may carry.
+pub const MAX_FILES: int = 100000;
+
+/// Largest manifest/resume/start blob; they travel split across frames.
+pub const MAX_BLOB: int = 134217728;
+
+/// Sealed frame kinds (first plaintext byte).
+pub const KIND_DATA: int = 1;
+
+pub const KIND_MANIFEST: int = 16;
+
+pub const KIND_FILE_BEGIN: int = 17;
+
+pub const KIND_FILE_DONE: int = 18;
+
+pub const KIND_SESSION_DONE: int = 19;
+
+/// Receiver → sender: per manifest entry, bytes already held + SHA-256 of them.
+pub const KIND_RESUME: int = 20;
+
+/// Sender → receiver: per manifest entry, the offset its data starts at.
+pub const KIND_START: int = 21;
+
+/// `file_index` in the AAD of frames that belong to no file.
+pub const NO_FILE: int = 4294967295;
+
+/// Nonce direction tags. Both peers seal with the same key, so each direction owns a
+/// disjoint nonce space: a receiver frame never reuses a sender nonce.
+pub const FROM_SENDER: int = 0;
+
+pub const FROM_RECEIVER: int = 1;
+
 pub struct Hello {
     salt: bytes,
-    name: string,
-    size: int,
+    file_count: int,
+    total_size: int,
     chunk_size: int,
+}
+
+/// One file of the batch: its relative wire path and size.
+pub struct Entry {
+    path: string,
+    size: int,
+}
+
+/// What the receiver already holds of one entry: `offset` bytes whose SHA-256 is `digest`.
+pub struct Held {
+    offset: int,
+    digest: bytes,
 }
 
 pub fn be64(n: int) -> bytes {
@@ -49,61 +99,319 @@ pub fn read_be64(b: bytes) -> int {
     n
 }
 
-fn be32(n: int) -> bytes {
+pub fn be32(n: int) -> bytes {
     bytes_of([n >> 24 & 255, n >> 16 & 255, n >> 8 & 255, n & 255])
 }
 
-fn read_be32(b: bytes) -> int {
+pub fn read_be32(b: bytes) -> int {
     (b[0] & 255) << 24 | (b[1] & 255) << 16 | (b[2] & 255) << 8 | b[3] & 255
 }
 
-fn encode_hello(h: Hello) -> bytes {
-    let name_b = h.name.to_bytes();
+/// A cursor over a decoded payload: every read is bounds-checked.
+struct Reader {
+    data: bytes,
+    off: int,
+}
+
+fn take(r: Reader, n: int) -> Result<(Reader, bytes), string> {
+    if (n < 0 || r.off + n > r.data.len()) {
+        return Result.Err("truncated payload");
+    }
+    Result.Ok((Reader { data: r.data, off: r.off + n }, r.data.sub_bytes(r.off, r.off + n)))
+}
+
+fn take32(r: Reader) -> Result<(Reader, int), string> {
+    let (r1, b) = take(r, 4)?;
+    Result.Ok((r1, read_be32(b)))
+}
+
+fn take64(r: Reader) -> Result<(Reader, int), string> {
+    let (r1, b) = take(r, 8)?;
+    let n = read_be64(b);
+    if (n < 0) {
+        return Result.Err("invalid 64-bit field");
+    }
+    Result.Ok((r1, n))
+}
+
+fn finished(r: Reader) -> Result<int, string> {
+    if (r.off != r.data.len()) {
+        return Result.Err("trailing bytes in payload");
+    }
+    Result.Ok(0)
+}
+
+pub fn encode_hello(h: Hello) -> bytes {
     MAGIC
         + bytes_of([VERSION])
         + h.salt
-        + be32(name_b.len())
-        + name_b
-        + be64(h.size)
+        + be32(h.file_count)
+        + be64(h.total_size)
         + be32(h.chunk_size)
 }
 
-fn decode_hello(payload: bytes) -> Result<Hello, string> {
-    if (payload.len() < 4 + 1 + SALT_LEN + 4 + 8 + 4) {
-        return Result.Err("hello too short");
+pub fn decode_hello(payload: bytes) -> Result<Hello, string> {
+    if (payload.len() < 5 || payload.sub_bytes(0, 4) != MAGIC) {
+        return Result.Err("invalid magic (not a takeit peer)");
     }
-    if (payload.sub_bytes(0, 4) != MAGIC) {
-        return Result.Err("invalid magic");
+    let version = payload[4] & 255;
+    if (version != VERSION) {
+        return Result.Err(
+            "peer speaks takeit protocol v${version}, this takeit speaks v${VERSION}: update both sides"
+        );
     }
-    if ((payload[4] & 255) != VERSION) {
-        return Result.Err("unsupported version");
+    let r0 = Reader { data: payload, off: 5 };
+    let (r1, salt) = take(r0, SALT_LEN)?;
+    let (r2, count) = take32(r1)?;
+    let (r3, total) = take64(r2)?;
+    let (r4, chunk) = take32(r3)?;
+    finished(r4)?;
+    if (count < 1 || count > MAX_FILES) {
+        return Result.Err("invalid file count in hello: ${count}");
     }
-    let salt = payload.sub_bytes(5, 5 + SALT_LEN);
-    var off = 5 + SALT_LEN;
-    let name_len = read_be32(payload.sub_bytes(off, off + 4));
-    off = off + 4;
-    if (name_len < 0 || off + name_len + 8 + 4 > payload.len()) {
-        return Result.Err("invalid name in hello");
+    if (chunk < 1 || chunk > DEFAULT_CHUNK) {
+        return Result.Err("invalid chunk size in hello: ${chunk}");
     }
-    let name_b = payload.sub_bytes(off, off + name_len);
-    off = off + name_len;
-    match (from_utf8(name_b)) {
-        Result.Err(_) => Result.Err("name is not utf-8"),
-        Result.Ok(name) => {
-            let size = read_be64(payload.sub_bytes(off, off + 8));
-            off = off + 8;
-            let chunk_size = read_be32(payload.sub_bytes(off, off + 4));
-            Result.Ok(Hello { salt: salt, name: name, size: size, chunk_size: chunk_size })
+    Result.Ok(Hello { salt: salt, file_count: count, total_size: total, chunk_size: chunk })
+}
+
+pub fn encode_manifest(entries: [Entry]) -> bytes {
+    var parts: [bytes] = [be32(entries.len())];
+    for e in entries {
+        let p = e.path.to_bytes();
+        parts.push(be32(p.len()) + p + be64(e.size));
+    }
+    bytes_concat(parts)
+}
+
+/// Decodes and VALIDATES a manifest against its hello: entry count, sizes adding up to
+/// the total, every path safe (paths.check) and unique.
+pub fn decode_manifest(blob: bytes, hello: Hello) -> Result<[Entry], string> {
+    var r = Reader { data: blob, off: 0 };
+    let (r1, count) = take32(r)?;
+    r = r1;
+    if (count != hello.file_count) {
+        return Result.Err("manifest lists ${count} files, hello announced ${hello.file_count}");
+    }
+    var entries: [Entry] = [];
+    var seen: Map<string, int> = Map.new();
+    var sum = 0;
+    var i = 0;
+    while (i < count) {
+        let (r2, plen) = take32(r)?;
+        if (plen > paths.MAX_PATH) {
+            return Result.Err("path longer than ${paths.MAX_PATH} bytes in manifest");
+        }
+        let (r3, pb) = take(r2, plen)?;
+        let (r4, size) = take64(r3)?;
+        r = r4;
+        let path = match (from_utf8(pb)) {
+            Result.Err(_) => {
+                return Result.Err("manifest path is not utf-8");
+            },
+            Result.Ok(s) => s,
+        };
+        paths.check(path)?;
+        if (seen.contains_key(path)) {
+            return Result.Err("duplicate path in manifest: ${path}");
+        }
+        seen.insert(path, i);
+        sum = sum + size;
+        entries.push(Entry { path: path, size: size });
+        i = i + 1;
+    }
+    finished(r)?;
+    if (sum != hello.total_size) {
+        return Result.Err("manifest sizes add up to ${sum}, hello announced ${hello.total_size}");
+    }
+    Result.Ok(entries)
+}
+
+pub fn encode_resume(held: [Held]) -> bytes {
+    var parts: [bytes] = [be32(held.len())];
+    for h in held {
+        parts.push(be64(h.offset) + h.digest);
+    }
+    bytes_concat(parts)
+}
+
+pub fn decode_resume(blob: bytes, count: int) -> Result<[Held], string> {
+    var r = Reader { data: blob, off: 0 };
+    let (r1, n) = take32(r)?;
+    r = r1;
+    if (n != count) {
+        return Result.Err("resume offer has ${n} entries, the manifest ${count}");
+    }
+    var held: [Held] = [];
+    var i = 0;
+    while (i < n) {
+        let (r2, offset) = take64(r)?;
+        let (r3, digest) = take(r2, 32)?;
+        r = r3;
+        held.push(Held { offset: offset, digest: digest });
+        i = i + 1;
+    }
+    finished(r)?;
+    Result.Ok(held)
+}
+
+pub fn encode_starts(starts: [int]) -> bytes {
+    var parts: [bytes] = [be32(starts.len())];
+    for s in starts {
+        parts.push(be64(s));
+    }
+    bytes_concat(parts)
+}
+
+pub fn decode_starts(blob: bytes, count: int) -> Result<[int], string> {
+    var r = Reader { data: blob, off: 0 };
+    let (r1, n) = take32(r)?;
+    r = r1;
+    if (n != count) {
+        return Result.Err("start offsets have ${n} entries, the manifest ${count}");
+    }
+    var starts: [int] = [];
+    var i = 0;
+    while (i < n) {
+        let (r2, s) = take64(r)?;
+        r = r2;
+        starts.push(s);
+        i = i + 1;
+    }
+    finished(r)?;
+    Result.Ok(starts)
+}
+
+/// `file_index ‖ digest`: the body of FileDone and (with the file count) SessionDone.
+pub fn encode_index_digest(index: int, digest: bytes) -> bytes {
+    be32(index) + digest
+}
+
+pub fn decode_index_digest(body: bytes) -> Result<(int, bytes), string> {
+    let r0 = Reader { data: body, off: 0 };
+    let (r1, index) = take32(r0)?;
+    let (r2, digest) = take(r1, 32)?;
+    finished(r2)?;
+    Result.Ok((index, digest))
+}
+
+pub fn nonce_for(index: int, dir: int) -> bytes {
+    be64(index) + be32(dir)
+}
+
+/// Binds a sealed frame to its position, its file and the session total: frames cannot be
+/// reordered, replayed into another file or spliced into another session.
+pub fn aad_for(index: int, file_index: int, total: int) -> bytes {
+    be64(index) + be32(file_index) + be64(total)
+}
+
+/// The encrypted channel after auth: one frame counter per direction.
+pub struct Link {
+    conn: framing.Conn,
+    key: bytes,
+    /// Direction tag of the frames THIS side seals; the peer's is the other one.
+    dir: int,
+    total: int,
+    sent: int,
+    got: int,
+}
+
+/// An opened frame.
+pub struct Frame {
+    kind: int,
+    body: bytes,
+}
+
+pub fn link(conn: framing.Conn, key: bytes, dir: int, total: int) -> Link {
+    Link { conn: conn, key: key, dir: dir, total: total, sent: 0, got: 0 }
+}
+
+/// Seals `kind` + `body` as the next outgoing frame of `file_index` and sends it.
+pub fn seal(l: Link, file_index: int, kind: int, body: bytes) -> Result<Link, string> {
+    let plain = bytes_of([kind]) + body;
+    let nonce = nonce_for(l.sent, l.dir);
+    let aad = aad_for(l.sent, file_index, l.total);
+    match (crypto.chacha20poly1305_seal(l.key, nonce, aad, plain)) {
+        Option.None => Result.Err("encryption failed"),
+        Option.Some(ct) => {
+            let c = framing.write_frame(l.conn, ct)?;
+            var next = l;
+            next.conn = c;
+            next.sent = l.sent + 1;
+            Result.Ok(next)
         },
     }
 }
 
-pub fn nonce_for(index: int) -> bytes {
-    be64(index) + b"\x00\x00\x00\x00"
+/// Reads and opens the next incoming frame, which must belong to `file_index`.
+pub fn open(l: Link, file_index: int) -> Result<(Link, Frame), string> {
+    let (c, ct) = framing.read_frame(l.conn, MAX_FRAME)?;
+    let peer = 1 - l.dir;
+    let nonce = nonce_for(l.got, peer);
+    let aad = aad_for(l.got, file_index, l.total);
+    match (crypto.chacha20poly1305_open(l.key, nonce, aad, ct)) {
+        Option.None => Result.Err("decryption failed (tampered data or wrong key)"),
+        Option.Some(plain) => {
+            if (plain.len() < 1) {
+                return Result.Err("empty frame");
+            }
+            var next = l;
+            next.conn = c;
+            next.got = l.got + 1;
+            Result.Ok((next, Frame { kind: plain[0] & 255, body: plain.sub_bytes(1, plain.len()) }))
+        },
+    }
 }
 
-pub fn aad_for(index: int, name: string, size: int) -> bytes {
-    be64(index) + name.to_bytes() + be64(size)
+/// Like `open`, failing unless the frame is of `kind`.
+pub fn expect(l: Link, file_index: int, kind: int) -> Result<(Link, bytes), string> {
+    let (next, f) = open(l, file_index)?;
+    if (f.kind != kind) {
+        return Result.Err("expected frame kind ${kind}, got ${f.kind}");
+    }
+    Result.Ok((next, f.body))
+}
+
+/// Sends `blob` as frames of `kind`: the first starts with its length (u64 BE), and the
+/// pieces after it carry up to DEFAULT_CHUNK bytes each.
+pub fn send_blob(l: Link, kind: int, blob: bytes) -> Result<Link, string> {
+    var link = l;
+    var off = 0;
+    var first = true;
+    while (first || off < blob.len()) {
+        let end = math.min(off + DEFAULT_CHUNK, blob.len());
+        let piece = blob.sub_bytes(off, end);
+        let body = if (first) { be64(blob.len()) + piece } else { piece };
+        link = seal(link, NO_FILE, kind, body)?;
+        off = end;
+        first = false;
+    }
+    Result.Ok(link)
+}
+
+/// Receives a blob sent with `send_blob`.
+pub fn recv_blob(l: Link, kind: int) -> Result<(Link, bytes), string> {
+    let (l1, body) = expect(l, NO_FILE, kind)?;
+    if (body.len() < 8) {
+        return Result.Err("truncated blob header");
+    }
+    let len = read_be64(body.sub_bytes(0, 8));
+    if (len < 0 || len > MAX_BLOB) {
+        return Result.Err("blob too large: ${len}");
+    }
+    var parts: [bytes] = [body.sub_bytes(8, body.len())];
+    var have = body.len() - 8;
+    var link = l1;
+    while (have < len) {
+        let (l2, more) = expect(link, NO_FILE, kind)?;
+        link = l2;
+        parts.push(more);
+        have = have + more.len();
+    }
+    if (have != len) {
+        return Result.Err("blob longer than announced");
+    }
+    Result.Ok((link, bytes_concat(parts)))
 }
 
 pub fn send_hello(c: framing.Conn, h: Hello) -> Result<framing.Conn, string> {
@@ -111,143 +419,113 @@ pub fn send_hello(c: framing.Conn, h: Hello) -> Result<framing.Conn, string> {
 }
 
 pub fn recv_hello(c: framing.Conn) -> Result<(framing.Conn, Hello), string> {
-    match (framing.read_frame(c, MAX_FRAME)) {
-        Result.Err(e) => Result.Err(e),
-        Result.Ok(pair) => {
-            let (c2, payload) = pair;
-            match (decode_hello(payload)) {
-                Result.Err(e) => Result.Err(e),
-                Result.Ok(h) => Result.Ok((c2, h)),
-            }
-        },
-    }
+    let (c2, payload) = framing.read_frame(c, MAX_FRAME)?;
+    let h = decode_hello(payload)?;
+    Result.Ok((c2, h))
 }
 
 /// Sender: sends a nonce and verifies the receiver's HMAC response.
 pub fn auth_as_sender(c: framing.Conn, key: bytes) -> Result<framing.Conn, string> {
     let nonce = crypto.random_bytes(16);
-    match (framing.write_frame(c, nonce)) {
-        Result.Err(e) => Result.Err(e),
-        Result.Ok(c1) => match (framing.read_frame(c1, 64)) {
-            Result.Err(e) => Result.Err(e),
-            Result.Ok(pair) => {
-                let (c2, resp) = pair;
-                let expect = crypto.hmac_sha256(key, b"auth" + nonce);
-                if (resp != expect) {
-                    Result.Err("authentication failed (wrong password?)")
-                } else {
-                    Result.Ok(c2)
-                }
-            },
-        },
+    let c1 = framing.write_frame(c, nonce)?;
+    let (c2, resp) = framing.read_frame(c1, 64)?;
+    let expect_mac = crypto.hmac_sha256(key, b"auth" + nonce);
+    if (!crypto.constant_time_eq(resp, expect_mac)) {
+        return Result.Err("authentication failed (wrong password?)");
     }
+    Result.Ok(c2)
 }
 
 /// Receiver: reads the nonce and replies with HMAC.
 pub fn auth_as_receiver(c: framing.Conn, key: bytes) -> Result<framing.Conn, string> {
-    match (framing.read_frame(c, 64)) {
-        Result.Err(e) => Result.Err(e),
-        Result.Ok(pair) => {
-            let (c1, nonce) = pair;
-            let mac = crypto.hmac_sha256(key, b"auth" + nonce);
-            framing.write_frame(c1, mac)
-        },
-    }
-}
-
-fn seal(key: bytes, nonce: bytes, aad: bytes, plain: bytes) -> Result<bytes, string> {
-    match (crypto.chacha20poly1305_seal(key, nonce, aad, plain)) {
-        Option.Some(ct) => Result.Ok(ct),
-        Option.None => Result.Err("encryption failed"),
-    }
-}
-
-fn open(key: bytes, nonce: bytes, aad: bytes, ct: bytes) -> Result<bytes, string> {
-    match (crypto.chacha20poly1305_open(key, nonce, aad, ct)) {
-        Option.Some(pt) => Result.Ok(pt),
-        Option.None => Result.Err("decryption failed (tampered data or wrong key)"),
-    }
-}
-
-/// Encrypts and sends a data chunk (`\\x01` + data) or the done frame (`\\x02` + digest).
-pub fn send_chunk(
-    c: framing.Conn,
-    key: bytes,
-    index: int,
-    name: string,
-    size: int,
-    kind: int,
-    body: bytes
-) -> Result<framing.Conn, string> {
-    let plain = bytes_of([kind]) + body;
-    let nonce = nonce_for(index);
-    let aad = aad_for(index, name, size);
-    match (seal(key, nonce, aad, plain)) {
-        Result.Err(e) => Result.Err(e),
-        Result.Ok(ct) => framing.write_frame(c, ct),
-    }
-}
-
-pub struct RecvChunk {
-    conn: framing.Conn,
-    kind: int,
-    body: bytes,
-}
-
-pub fn recv_chunk(
-    c: framing.Conn,
-    key: bytes,
-    index: int,
-    name: string,
-    size: int
-) -> Result<RecvChunk, string> {
-    match (framing.read_frame(c, MAX_FRAME)) {
-        Result.Err(e) => Result.Err(e),
-        Result.Ok(pair) => {
-            let (c2, ct) = pair;
-            let nonce = nonce_for(index);
-            let aad = aad_for(index, name, size);
-            match (open(key, nonce, aad, ct)) {
-                Result.Err(e) => Result.Err(e),
-                Result.Ok(plain) => {
-                    if (plain.len() < 1) {
-                        Result.Err("empty chunk")
-                    } else {
-                        Result.Ok(
-                            RecvChunk {
-                                conn: c2,
-                                kind: plain[0] & 255,
-                                body: plain.sub_bytes(1, plain.len())
-                            }
-                        )
-                    }
-                },
-            }
-        },
-    }
+    let (c1, nonce) = framing.read_frame(c, 64)?;
+    framing.write_frame(c1, crypto.hmac_sha256(key, b"auth" + nonce))
 }
 
 pub fn derive(password: string, salt: bytes) -> bytes {
     kdf.derive_key(password, salt)
 }
 
+fn sample_hello(count: int, total: int) -> Hello {
+    Hello { salt: crypto.random_bytes(16), file_count: count, total_size: total, chunk_size: 4096 }
+}
+
 @test
 fn hello_codec() {
-    let h = Hello {
-        salt: crypto.random_bytes(16),
-        name: "foto.bin",
-        size: 1024,
-        chunk_size: DEFAULT_CHUNK
-    };
+    let h = sample_hello(3, 1024);
     match (decode_hello(encode_hello(h))) {
         Result.Err(e) => panic(e),
         Result.Ok(h2) => {
-            assert(h2.name == h.name);
-            assert(h2.size == h.size);
-            assert(h2.chunk_size == h.chunk_size);
+            assert_eq(h2.file_count, 3);
+            assert_eq(h2.total_size, 1024);
+            assert_eq(h2.chunk_size, 4096);
             assert(h2.salt == h.salt);
         },
     }
+}
+
+@test
+fn another_version_is_named_in_the_error() {
+    let old = MAGIC + bytes_of([2]) + crypto.random_bytes(40);
+    match (decode_hello(old)) {
+        Result.Ok(_) => panic("a v2 hello must be rejected"),
+        Result.Err(e) => assert(e.contains("v2") && e.contains("v4")),
+    }
+    assert(decode_hello(b"HTTP/1.1 200").is_err());
+}
+
+@test
+fn manifest_codec_and_validation() {
+    let entries = [Entry { path: "a.txt", size: 10 }, Entry { path: "dir/b.bin", size: 0 }];
+    let blob = encode_manifest(entries);
+    match (decode_manifest(blob, sample_hello(2, 10))) {
+        Result.Err(e) => panic(e),
+        Result.Ok(got) => {
+            assert_eq(got.len(), 2);
+            assert_eq(got[1].path, "dir/b.bin");
+            assert_eq(got[0].size, 10);
+        },
+    }
+    // The hello's count and total must agree with the manifest.
+    assert(decode_manifest(blob, sample_hello(3, 10)).is_err());
+    assert(decode_manifest(blob, sample_hello(2, 11)).is_err());
+    // Hostile paths and duplicates never get through.
+    let evil = encode_manifest([Entry { path: "../../etc/x", size: 1 }]);
+    assert(decode_manifest(evil, sample_hello(1, 1)).is_err());
+    let dup = encode_manifest([Entry { path: "a", size: 1 }, Entry { path: "a", size: 1 }]);
+    assert(decode_manifest(dup, sample_hello(2, 2)).is_err());
+    assert(decode_manifest(blob.sub_bytes(0, blob.len() - 1), sample_hello(2, 10)).is_err());
+}
+
+@test
+fn resume_and_start_codecs() {
+    let d = crypto.sha256(b"prefix");
+    match (decode_resume(encode_resume([Held { offset: 7, digest: d }]), 1)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(held) => {
+            assert_eq(held[0].offset, 7);
+            assert(held[0].digest == d);
+        },
+    }
+    assert(decode_resume(encode_resume([]), 1).is_err());
+    match (decode_starts(encode_starts([0, 42]), 2)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(s) => assert_eq(s[1], 42),
+    }
+    match (decode_index_digest(encode_index_digest(5, d))) {
+        Result.Err(e) => panic(e),
+        Result.Ok(pair) => {
+            let (i, got) = pair;
+            assert_eq(i, 5);
+            assert(got == d);
+        },
+    }
+}
+
+@test
+fn directions_never_share_a_nonce() {
+    assert(nonce_for(0, FROM_SENDER) != nonce_for(0, FROM_RECEIVER));
+    assert_eq(nonce_for(7, FROM_RECEIVER).len(), 12);
 }
 
 @test

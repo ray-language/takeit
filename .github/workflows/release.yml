@@ -1,9 +1,12 @@
 # takeit RELEASE pipeline. Pushing a `vX.Y.Z` tag builds the native binary for every
 # supported platform and uploads it to that tag's GitHub Release.
 #
-# The raylang toolchain lives in a (private) sibling repo. CI checks it out with
-# RAYLANG_TOKEN and builds `ray` from source; takeit itself has no path deps, so
-# the project only needs `ray` on PATH.
+# The raylang toolchain is the release pinned in ray.toml (`raylang = "X.Y.Z"`),
+# downloaded prebuilt for each runner's target from ray-language/raylang's Releases:
+# CI tests and builds with exactly the `ray` the project was validated against, not
+# whatever raylang's main happens to be. takeit has no path deps, so the project
+# only needs `ray` on PATH (plus cargo for `--native`, which fetches the ray-runtime
+# crates on the first build).
 #
 # Every platform compiles NATIVELY on its own runner. `ray build --release` adds
 # `-C target-cpu=native` unless `--target` is given, which would produce binaries
@@ -26,8 +29,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RAYLANG_REPO: roberto-ayala/raylang
-  RAYLANG_REF: main
 
 jobs:
   # Create (or reuse, if it already exists) the tag's Release, with generated notes.
@@ -72,20 +73,12 @@ jobs:
         include:
           - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
-          - { os: macos-13,         target: x86_64-apple-darwin }
+          - { os: macos-15-intel,   target: x86_64-apple-darwin }
           - { os: macos-14,         target: aarch64-apple-darwin }
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out takeit
         uses: actions/checkout@v4
-
-      - name: Check out raylang (toolchain)
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.RAYLANG_REPO }}
-          ref: ${{ env.RAYLANG_REF }}
-          token: ${{ secrets.RAYLANG_TOKEN || github.token }}
-          path: raylang
 
       - name: Install Rust stable + target
         run: |
@@ -93,33 +86,42 @@ jobs:
           rustup default stable
           rustup target add ${{ matrix.target }}
 
-      - name: Resolve the raylang revision
-        id: raylang
+      - name: Install the pinned raylang release
         shell: bash
-        working-directory: raylang
-        run: echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+        run: |
+          version="$(sed -n 's/^raylang *= *"\(.*\)"/\1/p' ray.toml | head -1)"
+          if [ -z "$version" ]; then
+            echo "::error::ray.toml does not pin a raylang version"
+            exit 1
+          fi
+          url="https://github.com/ray-language/raylang/releases/download/v$version/raylang-${{ matrix.target }}.tar.gz"
+          echo "raylang $version from $url"
+          dir="$RUNNER_TEMP/raylang"
+          mkdir -p "$dir"
+          curl -sSfL --retry 3 "$url" | tar xz -C "$dir"
+          if ! "$dir/ray" version | grep -qxF "raylang $version"; then
+            echo "::error::downloaded ray reports '$("$dir/ray" version | head -1)', expected raylang $version"
+            exit 1
+          fi
+          echo "$dir" >>"$GITHUB_PATH"
+          echo "RAYLANG_VERSION=$version" >>"$GITHUB_ENV"
 
-      # The toolchain build dominates the run; key the cache on the exact raylang
-      # revision so it only rebuilds when raylang actually moves.
-      - name: Cache the raylang toolchain build
+      # The native build compiles the ray-runtime crates; cache them per raylang release.
+      - name: Cache the native build's crates
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            raylang/target
-          key: ray-toolchain-${{ matrix.target }}-${{ steps.raylang.outputs.sha }}
-          restore-keys: ray-toolchain-${{ matrix.target }}-
+          key: ray-native-${{ matrix.target }}-${{ env.RAYLANG_VERSION }}
+          restore-keys: ray-native-${{ matrix.target }}-
 
-      - name: Build the ray toolchain
-        shell: bash
-        working-directory: raylang
+      # Informational: it exits 1 when anything optional (extra targets, the offline
+      # vendor) is missing, which the build below does not need.
+      - name: ray toolchain status
         run: |
-          cargo build --release --bin ray
-          echo "$PWD/target/release" >>"$GITHUB_PATH"
-
-      - name: ray version
-        run: ray version
+          ray version
+          ray toolchain status || true
 
       - name: Run the test suite
         run: ray test

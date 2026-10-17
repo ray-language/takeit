@@ -1,0 +1,75 @@
+// Rutas del manifiesto: relativas, POSIX y sin escapatoria. Las reglas son puras (sin
+// disco) para que el receptor rechace un manifiesto hostil antes de tocar nada.
+
+/// Longest accepted manifest path, in UTF-8 bytes.
+pub const MAX_PATH: int = 1024;
+
+/// `Ok(0)` when `p` is a safe relative path: `/`-separated, no leading `/`, no empty,
+/// `.` or `..` component, no `\\` or NUL, at most `MAX_PATH` bytes.
+pub fn check(p: string) -> Result<int, string> {
+    if (p.len() == 0) {
+        return Result.Err("empty path in manifest");
+    }
+    if (p.to_bytes().len() > MAX_PATH) {
+        return Result.Err("path longer than ${MAX_PATH} bytes in manifest");
+    }
+    if (p.starts_with("/")) {
+        return Result.Err("absolute path in manifest: ${p}");
+    }
+    if (p.contains("\\") || p.contains("\0")) {
+        return Result.Err("invalid character in manifest path: ${p}");
+    }
+    for part in p.split("/") {
+        if (part == "" || part == "." || part == "..") {
+            return Result.Err("invalid component in manifest path: ${p}");
+        }
+    }
+    Result.Ok(0)
+}
+
+/// The last component of `path` (`a/b/c.txt` → `c.txt`), ignoring trailing slashes.
+pub fn base_name(path: string) -> string {
+    let parts = path.split("/").filter(fn(s: string) -> bool { s != "" });
+    if (parts.len() == 0) { path } else { parts[parts.len() - 1] }
+}
+
+/// Everything before the last `/` (`a/b/c.txt` → `a/b`); `"."` when there is none.
+pub fn parent(path: string) -> string {
+    let parts = path.split("/");
+    if (parts.len() <= 1) {
+        return ".";
+    }
+    let head = parts.slice(0, parts.len() - 1).join("/");
+    if (head == "") { "/" } else { head }
+}
+
+@test
+fn safe_paths_pass() {
+    assert(check("a.txt").is_ok());
+    assert(check("fotos/2026/img 01.jpg").is_ok());
+    assert(check("ñandú/..hidden").is_ok());
+}
+
+@test
+fn escaping_paths_are_rejected() {
+    assert(check("").is_err());
+    assert(check("/etc/passwd").is_err());
+    assert(check("../x").is_err());
+    assert(check("a/../../x").is_err());
+    assert(check("a/./b").is_err());
+    assert(check("a//b").is_err());
+    assert(check("a/").is_err());
+    assert(check("a\\b").is_err());
+    assert(check("a\0b").is_err());
+    assert(check("x".repeat(MAX_PATH + 1)).is_err());
+}
+
+@test
+fn names_and_parents() {
+    assert_eq(base_name("a/b/c.txt"), "c.txt");
+    assert_eq(base_name("dir/"), "dir");
+    assert_eq(base_name("c.txt"), "c.txt");
+    assert_eq(parent("a/b/c.txt"), "a/b");
+    assert_eq(parent("c.txt"), ".");
+    assert_eq(parent("/c.txt"), "/");
+}

@@ -174,3 +174,52 @@ fn the_total_is_what_the_caller_would_have_counted() {
     }
     let _ = fs.remove_all(dir);
 }
+
+@test
+fn a_range_stops_exactly_at_its_end() {
+    let dir = temp_dir();
+    let path = dir + "/sample.bin";
+    write_sample(path, 1000);
+    var joined = b"";
+    var sizes: [int] = [];
+    // 0..150 with 64-byte pieces: 64, 64 and the 22 that reach the end of the range.
+    match (fileread.for_each_chunk_range(path, 0, 150, 64, fn(piece: bytes) -> Result<int, string> {
+        sizes.push(piece.len());
+        joined = joined + piece;
+        Result.Ok(0)
+    })) {
+        Result.Err(e) => panic(e),
+        Result.Ok(n) => assert_eq(n, 150),
+    }
+    assert_eq(sizes.len(), 3);
+    assert_eq(sizes[2], 22);
+    match (fs.read_file_bytes(path)) {
+        Result.Ok(original) => assert(joined == original.sub_bytes(0, 150)),
+        Result.Err(e) => panic(e),
+    }
+    // An empty range reads nothing; the whole file as a range is the file.
+    match (fileread.for_each_chunk_range(path, 40, 40, 64, fn(_p: bytes) -> Result<int, string> {
+        Result.Err("an empty range must not deliver pieces")
+    })) {
+        Result.Err(e) => panic(e),
+        Result.Ok(n) => assert_eq(n, 0),
+    }
+    match (fileread.for_each_chunk_range(path, 0, 1000, 64, fn(_p: bytes) -> Result<int, string> {
+        Result.Ok(0)
+    })) {
+        Result.Err(e) => panic(e),
+        Result.Ok(n) => assert_eq(n, 1000),
+    }
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn a_range_past_the_end_or_backwards_is_an_error() {
+    let dir = temp_dir();
+    let path = dir + "/sample.bin";
+    write_sample(path, 100);
+    let ignore = fn(_p: bytes) -> Result<int, string> { Result.Ok(0) };
+    assert(fileread.for_each_chunk_range(path, 0, 101, 64, ignore).is_err());
+    assert(fileread.for_each_chunk_range(path, 50, 10, 64, ignore).is_err());
+    let _ = fs.remove_all(dir);
+}

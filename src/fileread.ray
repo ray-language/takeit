@@ -3,6 +3,7 @@
 // (el último puede ser menor) directamente del handle — sin `cat` externo, sin reensamblado,
 // memoria acotada por UN trozo y errores como valores desde el open.
 import std/fs;
+import std/math;
 
 /// Calls `on_chunk(piece)` for each piece of exactly `chunk_size` bytes (last may be
 /// smaller) and returns the total number of bytes read. Memory bounded by one chunk.
@@ -23,11 +24,27 @@ pub fn for_each_chunk_from(
     chunk_size: int,
     on_chunk: fn(bytes) -> Result<int, string>
 ) -> Result<int, string> {
+    for_each_chunk_range(path, start, -1, chunk_size, on_chunk)
+}
+
+/// Like `for_each_chunk_from`, but stops at byte offset `end` (exclusive; `end < 0` reads
+/// to EOF): the piece that crosses `end` is cut there. A resumed transfer uses it to hash
+/// the prefix both peers already share. `Err` if `end` is before `start` or past the end.
+pub fn for_each_chunk_range(
+    path: string,
+    start: int,
+    end: int,
+    chunk_size: int,
+    on_chunk: fn(bytes) -> Result<int, string>
+) -> Result<int, string> {
     if (chunk_size <= 0) {
         return Result.Err("invalid chunk_size");
     }
     if (start < 0) {
         return Result.Err("invalid start offset");
+    }
+    if (end >= 0 && end < start) {
+        return Result.Err("end offset ${end} is before start offset ${start}");
     }
     // Reanudar más allá del final no es "no queda nada": es un offset equivocado (el
     // receptor dijo tener más de lo que hay). Sin esto, la transferencia no enviaría nada
@@ -38,6 +55,9 @@ pub fn for_each_chunk_from(
                 return Result.Err(
                     "start offset ${start} is past the end of ${path} (${size} bytes)"
                 );
+            }
+            if (end > size) {
+                return Result.Err("end offset ${end} is past the end of ${path} (${size} bytes)");
             }
         },
         Result.Err(_) => { },
@@ -56,7 +76,15 @@ pub fn for_each_chunk_from(
                 }
             }
             while (err.len() == 0) {
-                match (fs.read_bytes(h, chunk_size)) {
+                let want = if (end < 0) {
+                    chunk_size
+                } else {
+                    math.min(chunk_size, end - start - total)
+                };
+                if (want <= 0) {
+                    break;
+                }
+                match (fs.read_bytes(h, want)) {
                     Result.Err(e) => {
                         err = e;
                     },
