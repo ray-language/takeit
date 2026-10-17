@@ -2,7 +2,7 @@
 # takeit installer. Downloads the prebuilt binary for this platform from the GitHub
 # Release and installs it into a directory on your PATH.
 #
-#   curl -sSfL https://raw.githubusercontent.com/ray-language/takeit/main/install.sh | sh
+#   curl -sSfL https://raw.githubusercontent.com/ray-language/takeit/master/install.sh | sh
 #
 # Environment variables (all optional):
 #   TAKEIT_VERSION   tag to install (e.g. v0.1.0). Default: the latest release.

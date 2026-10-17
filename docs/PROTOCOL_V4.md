@@ -142,6 +142,12 @@ todos los parciales a su destino y responde `OK` en claro.
 
 ## Destino y confinamiento (receptor)
 
+- Antes de escribir nada, el receptor comprueba que puede guardar el lote **fielmente en su
+  sistema**: en Windows, que cada nombre se pueda crear (sin `<>:"|?*` ni controles, sin nombres
+  de dispositivo como `CON` o `nul.txt`, sin punto o espacio final); en Windows y macOS (NTFS y
+  APFS ignoran mayúsculas), que no haya dos rutas que solo difieran en mayúsculas. Si no, error
+  con el nombre culpable.
+- Las rutas LOCALES usan el separador del sistema (`\` en Windows); las del manifiesto, siempre `/`.
 - Un lote de un archivo sin `/` en la ruta, con `--out` que no es un directorio existente ni
   acaba en `/`: `--out` es el archivo destino (como v1/v2).
 - En cualquier otro caso `--out` (o `.`) es el directorio base: cada entrada va a

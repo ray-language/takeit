@@ -19,7 +19,7 @@ pub struct Collected {
 fn walk(local: string, wire: string, acc: Collected) -> Result<Collected, string> {
     var a = acc;
     for name in fs.list_dir(local)? {
-        let lp = local + "/" + name;
+        let lp = paths.join_local(local, name);
         let wp = wire + "/" + name;
         let st = fs.stat(lp)?;
         if (st.kind == "file") {
@@ -47,7 +47,7 @@ pub fn collect(args: [string]) -> Result<Collected, string> {
             Result.Ok(r) => r,
         };
         let st = fs.stat(real)?;
-        let name = paths.base_name(real);
+        let name = paths.local_base_name(real);
         if (st.kind == "file") {
             acc.sources.push(
                 Source { local: real, entry: protocol.Entry { path: name, size: st.size } }

@@ -40,7 +40,7 @@ Comparte la contraseña por un canal aparte (chat, voz, SMS). Quien no la tenga 
 | Barra de progreso en stderr (`sending` / `receiving`) | ✅ listo |
 | Timeouts de idle en accept/lectura (`--timeout`, default 120 s) | ✅ listo |
 | Puerto libre automático (`--port 0` / omitido en send) | ✅ listo |
-| Binarios nativos + `install.sh` + CI de releases | ✅ listo |
+| Binarios nativos (Linux, macOS, Windows; x86_64 y ARM64) + `install.sh` + CI de releases | ✅ listo |
 | Tests (`roundtrip_test`, `chunk_review_test`) | ✅ listo |
 | Reanudación de una transferencia cortada, por archivo (solo se envía lo que falta) | ✅ listo |
 | Manifiesto cifrado, rutas confinadas al directorio de salida | ✅ listo |
@@ -62,14 +62,14 @@ Detalle del protocolo y roadmap: [`docs/PLAN.md`](docs/PLAN.md).
 ## Instalación rápida
 
 ```sh
-curl -sSfL https://raw.githubusercontent.com/ray-language/takeit/main/install.sh | sh
+curl -sSfL https://raw.githubusercontent.com/ray-language/takeit/master/install.sh | sh
 ```
 
 El script detecta tu OS/arquitectura, descarga el asset de la [última Release](https://github.com/ray-language/takeit/releases/latest) y lo deja en `~/.local/bin/takeit`.
 
 | Variable | Descripción | Default |
 |----------|-------------|---------|
-| `TAKEIT_VERSION` | Tag concreto (`v0.1.0`) | última release |
+| `TAKEIT_VERSION` | Tag concreto (`v0.2.0`) | última release |
 | `TAKEIT_BIN_DIR` | Directorio de instalación | `$HOME/.local/bin` |
 | `TAKEIT_REPO` | `owner/repo` | `ray-language/takeit` |
 | `TAKEIT_DRY_RUN` | Solo imprime el plan | (vacío) |
@@ -77,8 +77,22 @@ El script detecta tu OS/arquitectura, descarga el asset de la [última Release](
 Ejemplo:
 
 ```sh
-TAKEIT_VERSION=v0.1.0 curl -sSfL https://raw.githubusercontent.com/ray-language/takeit/main/install.sh | sh
+TAKEIT_VERSION=v0.2.0 curl -sSfL https://raw.githubusercontent.com/ray-language/takeit/master/install.sh | sh
 ```
+
+### Windows
+
+`install.sh` es para Linux y macOS. En Windows, descarga `takeit-x86_64-pc-windows-msvc.zip` (o
+`takeit-aarch64-pc-windows-msvc.zip` en ARM64) de la [última Release](https://github.com/ray-language/takeit/releases/latest),
+descomprime `takeit.exe` en una carpeta del `PATH` y úsalo igual desde PowerShell o `cmd`.
+
+- **Firewall**: quien ejecuta `takeit send` escucha conexiones. La primera vez, Windows pregunta si
+  permite el acceso a `takeit.exe`; sin ese permiso el receptor se queda en `connect timeout`.
+  (`takeit recv` solo se conecta hacia fuera y no lo necesita.)
+- **Nombres**: un emisor Linux/macOS puede enviar nombres que Windows no admite (`a:b.txt`,
+  `what?.txt`, `CON`, acabados en punto…) o que solo difieren en mayúsculas (`A.txt` y `a.txt`).
+  El receptor en Windows rechaza el lote **antes de escribir nada**, con un error que dice qué
+  nombre falla. (La colisión por mayúsculas se comprueba también en macOS.)
 
 ### Compilar desde el fuente
 
@@ -168,8 +182,10 @@ Al publicar un tag `vX.Y.Z` (con la misma versión que `ray.toml`), GitHub Actio
 - `aarch64-unknown-linux-gnu`
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
+- `x86_64-pc-windows-msvc`
+- `aarch64-pc-windows-msvc`
 
-y los sube a la Release del tag como `takeit-<target>.tar.gz` (+ `.sha256`).
+y los sube a la Release del tag como `takeit-<target>.tar.gz` (`.zip` en Windows) + `.sha256`.
 
 ```sh
 # Ejemplo de corte de versión

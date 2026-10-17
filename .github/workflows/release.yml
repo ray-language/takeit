@@ -13,8 +13,8 @@
 # that fault on older CPUs; passing the runner's own triple keeps the release
 # profile (opt3 + fat LTO + codegen-units=1) while staying portable.
 #
-# Assets carry no version in their name (`takeit-<target>.tar.gz`), so install.sh
-# can fetch `releases/latest/download/...` without going through the GitHub API.
+# Assets carry no version in their name (`takeit-<target>.tar.gz`, `.zip` on Windows), so
+# install.sh can fetch `releases/latest/download/...` without going through the GitHub API.
 name: release
 
 on:
@@ -71,17 +71,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
-          - { os: macos-15-intel,   target: x86_64-apple-darwin }
-          - { os: macos-14,         target: aarch64-apple-darwin }
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  exe: takeit,     pack: tar.gz }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, exe: takeit,     pack: tar.gz }
+          - { os: macos-15-intel,   target: x86_64-apple-darwin,       exe: takeit,     pack: tar.gz }
+          - { os: macos-14,         target: aarch64-apple-darwin,      exe: takeit,     pack: tar.gz }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,    exe: takeit.exe, pack: zip }
+          - { os: windows-11-arm,   target: aarch64-pc-windows-msvc,   exe: takeit.exe, pack: zip }
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out takeit
         uses: actions/checkout@v4
 
+      # Every step runs under bash, Git Bash on Windows, so the scripts are shared.
       - name: Install Rust stable + target
+        shell: bash
         run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            # Not every Windows ARM image ships rustup.
+            curl -sSfL --retry 3 -o "$RUNNER_TEMP/rustup-init.exe" https://win.rustup.rs/aarch64
+            "$RUNNER_TEMP/rustup-init.exe" -y --profile minimal --default-toolchain none
+            echo "$USERPROFILE/.cargo/bin" >>"$GITHUB_PATH"
+            export PATH="$USERPROFILE/.cargo/bin:$PATH"
+          fi
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add ${{ matrix.target }}
@@ -94,12 +105,19 @@ jobs:
             echo "::error::ray.toml does not pin a raylang version"
             exit 1
           fi
-          url="https://github.com/ray-language/raylang/releases/download/v$version/raylang-${{ matrix.target }}.tar.gz"
+          # raylang ships a .zip for Windows and a .tar.gz everywhere else.
+          ext="${{ matrix.pack }}"
+          url="https://github.com/ray-language/raylang/releases/download/v$version/raylang-${{ matrix.target }}.$ext"
           echo "raylang $version from $url"
           dir="$RUNNER_TEMP/raylang"
           mkdir -p "$dir"
-          curl -sSfL --retry 3 "$url" | tar xz -C "$dir"
-          if ! "$dir/ray" version | grep -qxF "raylang $version"; then
+          if [ "$ext" = "zip" ]; then
+            curl -sSfL --retry 3 -o "$RUNNER_TEMP/raylang.zip" "$url"
+            powershell -NoProfile -Command "Expand-Archive -Path '$RUNNER_TEMP/raylang.zip' -DestinationPath '$dir'"
+          else
+            curl -sSfL --retry 3 "$url" | tar xz -C "$dir"
+          fi
+          if ! "$dir/ray" version | tr -d '\r' | grep -qxF "raylang $version"; then
             echo "::error::downloaded ray reports '$("$dir/ray" version | head -1)', expected raylang $version"
             exit 1
           fi
@@ -119,11 +137,13 @@ jobs:
       # Informational: it exits 1 when anything optional (extra targets, the offline
       # vendor) is missing, which the build below does not need.
       - name: ray toolchain status
+        shell: bash
         run: |
           ray version
           ray toolchain status || true
 
       - name: Run the test suite
+        shell: bash
         run: ray test
 
       # `--target` is the runner's own triple: a native build, but without the
@@ -132,15 +152,19 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          ray build --native -o dist/takeit --release --target ${{ matrix.target }}
-          ls -la dist/takeit
+          ray build --native -o dist/${{ matrix.exe }} --release --target ${{ matrix.target }}
+          ls -la dist/${{ matrix.exe }}
 
-      - name: Package (tar.gz + sha256)
+      - name: Package (tar.gz or zip + sha256)
         id: package
         shell: bash
         run: |
-          asset="takeit-${{ matrix.target }}.tar.gz"
-          tar czf "$asset" -C dist takeit
+          asset="takeit-${{ matrix.target }}.${{ matrix.pack }}"
+          if [ "${{ matrix.pack }}" = "zip" ]; then
+            powershell -NoProfile -Command "Compress-Archive -Path 'dist/${{ matrix.exe }}' -DestinationPath '$asset'"
+          else
+            tar czf "$asset" -C dist ${{ matrix.exe }}
+          fi
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$asset" >"$asset.sha256"
           else

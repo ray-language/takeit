@@ -78,7 +78,7 @@ fn symlinks_inside_directories_are_skipped_but_an_argument_symlink_is_followed()
             // The argument symlink resolves to real.txt and goes by that name.
             assert_eq(wire_paths(c).join(","), "d/kept.txt,real.txt");
             assert_eq(c.skipped.len(), 1);
-            assert(c.skipped[0].ends_with("/d/link.txt"));
+            assert(c.skipped[0].ends_with("link.txt"));
         },
     }
     let _ = fs.remove_all(dir);

@@ -27,6 +27,85 @@ pub fn check(p: string) -> Result<int, string> {
     Result.Ok(0)
 }
 
+/// Characters Windows does not allow in a file name (besides the separators and controls).
+const WINDOWS_FORBIDDEN: [string] = ["<", ">", ":", "\"", "|", "?", "*"];
+
+/// Device names Windows reserves, with or without an extension (`CON`, `nul.txt`, …).
+const WINDOWS_RESERVED: [string] = [
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    "com1",
+    "com2",
+    "com3",
+    "com4",
+    "com5",
+    "com6",
+    "com7",
+    "com8",
+    "com9",
+    "lpt1",
+    "lpt2",
+    "lpt3",
+    "lpt4",
+    "lpt5",
+    "lpt6",
+    "lpt7",
+    "lpt8",
+    "lpt9"
+];
+
+/// `Ok(0)` when every component of the (already `check`ed) manifest path can be created
+/// on Windows: no `<>:"|?*` or control characters, no reserved device name, no trailing
+/// dot or space. A Unix sender can name files that a Windows receiver cannot save.
+pub fn check_windows(p: string) -> Result<int, string> {
+    for part in p.split("/") {
+        for c in WINDOWS_FORBIDDEN {
+            if (part.contains(c)) {
+                return Result.Err("${p}: '${c}' is not allowed in a Windows file name");
+            }
+        }
+        for b in part.to_bytes() {
+            if ((b & 255) < 32) {
+                return Result.Err(
+                    "${p}: control characters are not allowed in a Windows file name"
+                );
+            }
+        }
+        if (part.ends_with(".") || part.ends_with(" ")) {
+            return Result.Err("${p}: a Windows file name cannot end in a dot or a space");
+        }
+        let stem = part.split(".")[0].trim().to_lower();
+        if (WINDOWS_RESERVED.contains(stem)) {
+            return Result.Err("${p}: '${part}' is a reserved device name on Windows");
+        }
+    }
+    Result.Ok(0)
+}
+
+/// Whether this OS's usual file systems ignore case (NTFS, APFS by default): two manifest
+/// paths that differ only in case would land on the same file there.
+pub fn case_insensitive_fs() -> bool {
+    platform() == "windows" || platform() == "macos"
+}
+
+/// The name a LOCAL path goes by: like `base_name`, but on Windows `\` separates too
+/// (`fs.real_path` returns `C:\Users\…`). Elsewhere `\` is an ordinary character.
+pub fn local_base_name(path: string) -> string {
+    if (platform() == "windows") { base_name(path.replace("\\", "/")) } else { base_name(path) }
+}
+
+/// Joins a LOCAL directory and an entry name with this OS's separator.
+pub fn join_local(dir: string, name: string) -> string {
+    if (platform() == "windows") { dir + "\\" + name } else { dir + "/" + name }
+}
+
+/// Whether a LOCAL path ends in a separator (`/`, and `\` on Windows).
+pub fn ends_in_separator(path: string) -> bool {
+    path.ends_with("/") || platform() == "windows" && path.ends_with("\\")
+}
+
 /// The last component of `path` (`a/b/c.txt` → `c.txt`), ignoring trailing slashes.
 pub fn base_name(path: string) -> string {
     let parts = path.split("/").filter(fn(s: string) -> bool { s != "" });
@@ -72,4 +151,32 @@ fn names_and_parents() {
     assert_eq(parent("a/b/c.txt"), "a/b");
     assert_eq(parent("c.txt"), ".");
     assert_eq(parent("/c.txt"), "/");
+}
+
+@test
+fn names_windows_cannot_create_are_flagged() {
+    assert(check_windows("fotos/2026/img 01.jpg").is_ok());
+    assert(check_windows("ñandú/..hidden").is_ok());
+    assert(check_windows("a:b.txt").is_err());
+    assert(check_windows("dir/what?.txt").is_err());
+    assert(check_windows("x/CON").is_err());
+    assert(check_windows("nul.txt").is_err());
+    assert(check_windows("Com1.log").is_err());
+    assert(check_windows("console.txt").is_ok());
+    assert(check_windows("trailing.").is_err());
+    assert(check_windows("dir /x").is_err());
+    assert(check_windows("tab\there").is_err());
+}
+
+@test
+fn local_names_follow_the_platform_separators() {
+    assert_eq(local_base_name("/a/b/c.txt"), "c.txt");
+    if (platform() == "windows") {
+        assert_eq(local_base_name("C:\\Users\\x\\fotos"), "fotos");
+        assert(ends_in_separator("C:\\inbox\\"));
+    } else {
+        assert_eq(local_base_name("/tmp/a\\b"), "a\\b");
+        assert(!ends_in_separator("inbox\\"));
+    }
+    assert(ends_in_separator("inbox/"));
 }
