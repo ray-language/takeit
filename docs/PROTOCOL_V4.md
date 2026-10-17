@@ -1,6 +1,6 @@
 # Protocolo takeit v4 — uno o más archivos, con reanudación
 
-Contrato del protocolo que implementa takeit **0.2.0** (`src/protocol.ray`). Una sesión E2E
+Contrato del protocolo que implementa takeit desde **0.2.0** (`src/protocol.ray`). Una sesión E2E
 transfiere un lote de N ≥ 1 archivos; un solo archivo es el caso N = 1, con la misma máquina de
 estados. Complementa [`PLAN.md`](PLAN.md).
 

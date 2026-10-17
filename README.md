@@ -2,7 +2,7 @@
 
 Transferencia de archivos **peer-to-peer** con cifrado de extremo a extremo, escrita en [raylang](https://github.com/ray-language/raylang).
 
-**Versión actual: `0.2.0` (protocolo v4).** Un equipo envía archivos o carpetas; el otro recibe. No hay cuenta, no hay servidor en la nube, no hay intermediario que vea el contenido: solo TCP, una contraseña de un solo uso y AEAD (ChaCha20-Poly1305).
+**Versión actual: `0.3.0` (protocolo v4).** Un equipo envía archivos o carpetas; el otro recibe. No hay cuenta, no hay servidor en la nube, no hay intermediario que vea el contenido: solo TCP, una contraseña de un solo uso y AEAD (ChaCha20-Poly1305).
 
 ```text
 # Emisor
@@ -189,10 +189,10 @@ y los sube a la Release del tag como `takeit-<target>.tar.gz` (`.zip` en Windows
 
 ```sh
 # Ejemplo de corte de versión
-# 1. Bump version en ray.toml → 0.3.0
+# 1. Bump version en ray.toml → 0.4.0
 # 2. Commit y:
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 ## Licencia
