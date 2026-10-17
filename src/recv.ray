@@ -112,12 +112,12 @@ pub fn plan(entries: [protocol.Entry], out: string) -> Plan {
     if (entries.len() == 1
         && !entries[0].path.contains("/")
         && out != ""
-        && !out.ends_with("/")
+        && !paths.ends_in_separator(out)
         && !is_dir(out)) {
         return Plan { base: paths.parent(out), finals: [out], confined: false };
     }
     var base = if (out == "") { "." } else { out };
-    while (base.len() > 1 && base.ends_with("/")) {
+    while (base.len() > 1 && paths.ends_in_separator(base)) {
         base = base.substring(0, base.len() - 1);
     }
     let b = base;
@@ -126,6 +126,37 @@ pub fn plan(entries: [protocol.Entry], out: string) -> Plan {
         finals: entries.map(fn(e: protocol.Entry) -> string { join(b, e.path) }),
         confined: true
     }
+}
+
+/// Refuses, before anything is written, a manifest this machine cannot store faithfully:
+/// names Windows cannot create, and (on case-insensitive file systems) two paths that
+/// differ only in case — the second would overwrite the first.
+fn check_local_names(entries: [protocol.Entry]) -> Result<int, string> {
+    let windows = platform() == "windows";
+    let fold = paths.case_insensitive_fs();
+    var seen: Map<string, string> = Map.new();
+    for e in entries {
+        if (windows) {
+            match (paths.check_windows(e.path)) {
+                Result.Err(why) => {
+                    return Result.Err("cannot save on this system: " + why);
+                },
+                Result.Ok(_) => { },
+            }
+        }
+        if (fold) {
+            let key = e.path.to_lower();
+            match (seen.get(key)) {
+                Option.Some(other) => {
+                    return Result.Err(
+                        "${other} and ${e.path} differ only in case: they would be the same file here"
+                    );
+                },
+                Option.None => seen.insert(key, e.path),
+            }
+        }
+    }
+    Result.Ok(0)
 }
 
 /// Refuses a destination whose existing parent resolves outside `base` (a symlinked
@@ -316,6 +347,7 @@ pub fn receive_files(
     let l0 = protocol.link(c, key, protocol.FROM_RECEIVER, hello.total_size);
     let (l1, mblob) = protocol.recv_blob(l0, protocol.KIND_MANIFEST)?;
     let entries = protocol.decode_manifest(mblob, hello)?;
+    check_local_names(entries)?;
     let n = entries.len();
     let p = plan(entries, out);
     var offers: [protocol.Held] = [];
@@ -388,7 +420,7 @@ pub fn receive_files(
     let dest = if (n == 1) {
         p.finals[0]
     } else {
-        to_string(n) + " files in " + p.base + "/"
+        to_string(n) + " files in " + paths.join_local(p.base, "")
     };
     Result.Ok(Received { files: n, total: hello.total_size, resumed: resumed, dest: dest })
 }

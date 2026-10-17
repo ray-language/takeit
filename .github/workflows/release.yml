@@ -2,19 +2,17 @@
 # supported platform and uploads it to that tag's GitHub Release.
 #
 # The raylang toolchain is the release pinned in ray.toml (`raylang = "X.Y.Z"`),
-# downloaded prebuilt for each runner's target from ray-language/raylang's Releases:
-# CI tests and builds with exactly the `ray` the project was validated against, not
-# whatever raylang's main happens to be. takeit has no path deps, so the project
-# only needs `ray` on PATH (plus cargo for `--native`, which fetches the ray-runtime
-# crates on the first build).
+# downloaded prebuilt for each runner's target (.github/actions/setup-ray, shared with
+# ci.yml): releases are tested and built with exactly the `ray` the project was
+# validated against, not whatever raylang's main happens to be.
 #
 # Every platform compiles NATIVELY on its own runner. `ray build --release` adds
 # `-C target-cpu=native` unless `--target` is given, which would produce binaries
 # that fault on older CPUs; passing the runner's own triple keeps the release
 # profile (opt3 + fat LTO + codegen-units=1) while staying portable.
 #
-# Assets carry no version in their name (`takeit-<target>.tar.gz`), so install.sh
-# can fetch `releases/latest/download/...` without going through the GitHub API.
+# Assets carry no version in their name (`takeit-<target>.tar.gz`, `.zip` on Windows), so
+# install.sh can fetch `releases/latest/download/...` without going through the GitHub API.
 name: release
 
 on:
@@ -71,59 +69,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
-          - { os: macos-15-intel,   target: x86_64-apple-darwin }
-          - { os: macos-14,         target: aarch64-apple-darwin }
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  exe: takeit,     pack: tar.gz }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, exe: takeit,     pack: tar.gz }
+          - { os: macos-15-intel,   target: x86_64-apple-darwin,       exe: takeit,     pack: tar.gz }
+          - { os: macos-14,         target: aarch64-apple-darwin,      exe: takeit,     pack: tar.gz }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,    exe: takeit.exe, pack: zip }
+          - { os: windows-11-arm,   target: aarch64-pc-windows-msvc,   exe: takeit.exe, pack: zip }
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out takeit
         uses: actions/checkout@v4
 
-      - name: Install Rust stable + target
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          rustup target add ${{ matrix.target }}
-
-      - name: Install the pinned raylang release
-        shell: bash
-        run: |
-          version="$(sed -n 's/^raylang *= *"\(.*\)"/\1/p' ray.toml | head -1)"
-          if [ -z "$version" ]; then
-            echo "::error::ray.toml does not pin a raylang version"
-            exit 1
-          fi
-          url="https://github.com/ray-language/raylang/releases/download/v$version/raylang-${{ matrix.target }}.tar.gz"
-          echo "raylang $version from $url"
-          dir="$RUNNER_TEMP/raylang"
-          mkdir -p "$dir"
-          curl -sSfL --retry 3 "$url" | tar xz -C "$dir"
-          if ! "$dir/ray" version | grep -qxF "raylang $version"; then
-            echo "::error::downloaded ray reports '$("$dir/ray" version | head -1)', expected raylang $version"
-            exit 1
-          fi
-          echo "$dir" >>"$GITHUB_PATH"
-          echo "RAYLANG_VERSION=$version" >>"$GITHUB_ENV"
-
-      # The native build compiles the ray-runtime crates; cache them per raylang release.
-      - name: Cache the native build's crates
-        uses: actions/cache@v4
+      - name: Set up Rust and the pinned raylang
+        uses: ./.github/actions/setup-ray
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ray-native-${{ matrix.target }}-${{ env.RAYLANG_VERSION }}
-          restore-keys: ray-native-${{ matrix.target }}-
-
-      # Informational: it exits 1 when anything optional (extra targets, the offline
-      # vendor) is missing, which the build below does not need.
-      - name: ray toolchain status
-        run: |
-          ray version
-          ray toolchain status || true
+          target: ${{ matrix.target }}
 
       - name: Run the test suite
+        shell: bash
         run: ray test
 
       # `--target` is the runner's own triple: a native build, but without the
@@ -132,15 +95,19 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          ray build --native -o dist/takeit --release --target ${{ matrix.target }}
-          ls -la dist/takeit
+          ray build --native -o dist/${{ matrix.exe }} --release --target ${{ matrix.target }}
+          ls -la dist/${{ matrix.exe }}
 
-      - name: Package (tar.gz + sha256)
+      - name: Package (tar.gz or zip + sha256)
         id: package
         shell: bash
         run: |
-          asset="takeit-${{ matrix.target }}.tar.gz"
-          tar czf "$asset" -C dist takeit
+          asset="takeit-${{ matrix.target }}.${{ matrix.pack }}"
+          if [ "${{ matrix.pack }}" = "zip" ]; then
+            powershell -NoProfile -Command "Compress-Archive -Path 'dist/${{ matrix.exe }}' -DestinationPath '$asset'"
+          else
+            tar czf "$asset" -C dist ${{ matrix.exe }}
+          fi
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$asset" >"$asset.sha256"
           else

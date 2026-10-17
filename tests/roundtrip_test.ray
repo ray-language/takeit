@@ -408,3 +408,31 @@ fn a_symlinked_directory_in_the_output_cannot_be_written_through() {
     }
     let _ = fs.remove_all(dir);
 }
+
+@test
+fn names_that_collide_by_case_are_refused_where_case_is_ignored() {
+    let dir = temp_dir();
+    let out = dir + "/inbox";
+    let entries = [
+        protocol.Entry { path: "Report.txt", size: 2 },
+        protocol.Entry { path: "report.txt", size: 2 }
+    ];
+    let s = session_with(2, 4, out, true, hostile(entries));
+    if (platform() == "windows" || platform() == "macos") {
+        assert(expect_receiver_error(s).contains("differ only in case"));
+    }
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn names_windows_cannot_create_are_refused_on_windows() {
+    let dir = temp_dir();
+    let out = dir + "/inbox";
+    let entries = [protocol.Entry { path: "notes/what?.txt", size: 3 }];
+    let s = session_with(1, 3, out, true, hostile(entries));
+    if (platform() == "windows") {
+        assert(expect_receiver_error(s).contains("cannot save on this system"));
+        assert(!fs.exists(out));
+    }
+    let _ = fs.remove_all(dir);
+}
