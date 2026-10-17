@@ -5,7 +5,6 @@ import std/crypto;
 import framing;
 import protocol;
 import password;
-import kdf;
 import progress;
 import streamhash;
 import fileread;
@@ -49,8 +48,6 @@ pub fn run(opts: SendOpts) -> int {
     };
     let port = net.local_port(listener);
     let pw = password.generate();
-    let salt = crypto.random_bytes(protocol.SALT_LEN);
-    let key = kdf.derive_key(password.normalize(pw), salt);
     print("Password: " + pw);
     print("Waiting on " + opts.bind + ":" + to_string(port) + " …");
     print(
@@ -81,16 +78,19 @@ pub fn run(opts: SendOpts) -> int {
     close(listener);
     let c0 = framing.set_timeout(framing.from_handle(sock), opts.timeout_ms);
     let hello = protocol.Hello {
-        salt: salt,
+        sid: crypto.random_bytes(protocol.SID_LEN),
         file_count: files.len(),
         total_size: total,
         chunk_size: protocol.DEFAULT_CHUNK
     };
     let outcome = match (protocol.send_hello(c0, hello)) {
         Result.Err(e) => Result.Err(e),
-        Result.Ok(c1) => match (protocol.auth_as_sender(c1, key)) {
+        Result.Ok(c1) => match (protocol.auth_as_sender(c1, password.normalize(pw), hello)) {
             Result.Err(e) => Result.Err(e),
-            Result.Ok(c2) => stream_files(c2, key, files, protocol.DEFAULT_CHUNK),
+            Result.Ok(pair) => {
+                let (c2, key) = pair;
+                stream_files(c2, key, files, protocol.DEFAULT_CHUNK)
+            },
         },
     };
     framing.close_conn(c0);

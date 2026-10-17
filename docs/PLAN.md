@@ -22,7 +22,7 @@ CLI peer-to-peer: un equipo **envía** archivos o carpetas y otro **recibe** con
 |--------|-------------|
 | CSPRNG / secretos | `crypto.random_bytes` (no `std/random`) |
 | AEAD | `crypto.chacha20poly1305_seal/open` (key 32 B, nonce 12 B) |
-| Derivación | `crypto.hmac_sha256` + `crypto.sha256` (KDF propio; no hay HKDF/PBKDF nativo) |
+| Derivación | CPace: `crypto.x25519_shared_secret`, `crypto.sha512`, `crypto.hmac_sha512`, `std/bigint` (Elligator2); clave con `crypto.hkdf_sha256` |
 | Archivos | `fs.read_file_bytes` / `fs.write_file_bytes` |
 | Red | `net.tcp_listen` / `tcp_accept` / `tcp_connect` + `socket_*_bytes` |
 | CLI | `args()` |
@@ -50,20 +50,20 @@ Durante la transferencia, stderr muestra progreso (`enviando`/`recibiendo` con %
 ## Modelo de amenaza y cifrado
 
 1. **Contraseña fuera de banda** — único secreto compartido.
-2. **Salt público** (16 B) en el handshake en claro.
-3. **KDF v1**: `key = hmac_sha256(sha256(password_utf8), salt ‖ "takeit-v1")`.
+2. **sid público** (16 B) en el hello en claro.
+3. **PAKE (v5)**: CPace (CPACE-X25519-SHA512) con PRS = contraseña, sid y el hello como ADa; `key = hkdf_sha256(sid, ISK)`. Hasta v4 era `hmac_sha256(sha256(password), salt ‖ "takeit-v1")`, que permitía probar contraseñas offline con lo capturado del auth.
 4. **Payload**: frames AEAD; nonce = `contador u64 BE ‖ dirección u32 BE` (12 B; 0 = emisor, 1 = receptor: ambos cifran con la misma clave, así que cada dirección tiene su propio espacio de nonces); AAD = índice + archivo + tamaño total.
 5. **Integridad**: fallo de `open` → abortar (tampering / contraseña mala).
 6. **TLS** (futuro): no sustituye el E2E por contraseña.
 
 ## Protocolo (sobre TCP)
 
-Frames: `u32 BE length` + payload. Contrato completo: [`PROTOCOL_V4.md`](PROTOCOL_V4.md).
+Frames: `u32 BE length` + payload. Contrato completo: [`PROTOCOL_V5.md`](PROTOCOL_V5.md).
 
 | Fase | Contenido |
 |------|-----------|
-| 1. Hello (claro) | magic `TAKE`, versión 4, salt, nº de archivos, tamaño total, chunk_size |
-| 2. Auth | emisor envía nonce; ambos calculan `hmac(key, "auth"‖nonce)`; receptor responde |
+| 1. Hello (claro) | magic `TAKE`, versión 5, sid, nº de archivos, tamaño total, chunk_size |
+| 2. Auth (CPace) | emisor → `Ya`; receptor → `Yb ‖ Tb`; emisor → `Ta` (confirmación de clave mutua) |
 | 3. Manifest | rutas relativas + tamaños, cifrado |
 | 4. Resume | receptor → emisor: por archivo, bytes que ya tiene + SHA-256 de ellos |
 | 5. Start | emisor → receptor: por archivo, offset desde el que envía (el ofrecido o 0) |
@@ -79,7 +79,7 @@ takeit/
 ├── src/
 │   ├── main.ray          # parseo CLI, dispatch send|recv
 │   ├── password.ray      # generar/normalizar contraseña
-│   ├── kdf.ray           # password + salt → key 32 B
+│   ├── cpace.ray         # PAKE CPace (X25519 + Elligator2)
 │   ├── framing.ray       # Conn + read_exact / write_frame
 │   ├── protocol.ray      # hello, manifiesto, resume/start, frames AEAD, blobs
 │   ├── paths.ray         # validación de rutas del manifiesto
@@ -127,8 +127,9 @@ reanudado en el porcentaje pero no en la velocidad ni en el ETA (`progress.start
 | 5 | progreso, timeouts | ✅ |
 | 6 | relay / códigos cortos (opcional) | pendiente |
 | 7 | `ray build --native -o takeit --release` | ✅ (CI de releases multi-target) |
-| 8 | multi-archivo (protocolo v4) | ✅ → [`PROTOCOL_V4.md`](PROTOCOL_V4.md) |
+| 8 | multi-archivo (protocolo v4) | ✅ → [`PROTOCOL_V5.md`](PROTOCOL_V5.md) |
 | 9 | resume de transferencia | ✅ por archivo, dentro de v4 (ver arriba) |
+| 10 | PAKE (CPace) en vez de KDF de contraseña (protocolo v5) | ✅ |
 
 ## Flujo
 
@@ -138,15 +139,15 @@ sequenceDiagram
   participant U as Usuario (OOB)
   participant R as Receptor
 
-  S->>S: random password + salt
+  S->>S: random password + sid
   S->>U: muestra contraseña + host:puerto
   S->>S: tcp_listen
   U->>R: pasa contraseña
   R->>S: tcp_connect
-  S->>R: Hello (salt, meta)
-  R->>R: derive key(password, salt)
-  S->>R: auth challenge
-  R->>S: auth response
+  S->>R: Hello (sid, meta)
+  S->>R: CPace Ya
+  R->>S: CPace Yb + tag
+  S->>R: tag (clave confirmada en ambos sentidos)
   S->>R: Manifest (AEAD)
   R->>S: Resume: lo que ya tiene de cada archivo
   S->>R: Start: offset por archivo

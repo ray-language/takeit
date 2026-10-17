@@ -7,7 +7,6 @@ import std/crypto;
 import framing;
 import protocol;
 import password;
-import kdf;
 import send;
 import recv;
 import sources;
@@ -92,8 +91,6 @@ fn session_with(
     };
     let port = net.local_port(listener);
     let pw = password.generate();
-    let salt = crypto.random_bytes(protocol.SALT_LEN);
-    let key = kdf.derive_key(password.normalize(pw), salt);
     let done: Channel<Result<recv.Received, string>> = Channel.new();
 
     spawn(fn() {
@@ -106,10 +103,12 @@ fn session_with(
             Result.Err(e) => Result.Err(e),
             Result.Ok(pair) => {
                 let (c1, hello) = pair;
-                let key_r = kdf.derive_key(password.normalize(pw), hello.salt);
-                match (protocol.auth_as_receiver(c1, key_r)) {
+                match (protocol.auth_as_receiver(c1, password.normalize(pw), hello)) {
                     Result.Err(e) => Result.Err(e),
-                    Result.Ok(c2) => recv.receive_files(c2, key_r, hello, out, resume),
+                    Result.Ok(auth) => {
+                        let (c2, key_r) = auth;
+                        recv.receive_files(c2, key_r, hello, out, resume)
+                    },
                 }
             },
         };
@@ -124,7 +123,7 @@ fn session_with(
     close(listener);
     let c0 = framing.from_handle(sock);
     let hello = protocol.Hello {
-        salt: salt,
+        sid: crypto.random_bytes(protocol.SID_LEN),
         file_count: count,
         total_size: total,
         chunk_size: CHUNK
@@ -133,9 +132,9 @@ fn session_with(
         Result.Err(e) => panic(e),
         Result.Ok(c) => c,
     };
-    let c2 = match (protocol.auth_as_sender(c1, key)) {
+    let (c2, key) = match (protocol.auth_as_sender(c1, password.normalize(pw), hello)) {
         Result.Err(e) => panic(e),
-        Result.Ok(c) => c,
+        Result.Ok(pair) => pair,
     };
     let sent = serve(c2, key);
     framing.close_conn(c2);
@@ -435,4 +434,109 @@ fn names_windows_cannot_create_are_refused_on_windows() {
         assert(!fs.exists(out));
     }
     let _ = fs.remove_all(dir);
+}
+
+/// Both ends of the CPace handshake alone: the sender announces `sent_hello`, the
+/// receiver authenticates as if it had read `seen_hello` (a hello altered in transit).
+fn handshake(
+    sender_pw: string,
+    receiver_pw: string,
+    sent_hello: protocol.Hello,
+    seen_hello: protocol.Hello
+) -> (Result<bytes, string>, Result<bytes, string>) {
+    let listener = match (net.tcp_listen("127.0.0.1", 0)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(l) => l,
+    };
+    let port = net.local_port(listener);
+    let done: Channel<Result<bytes, string>> = Channel.new();
+    spawn(fn() {
+        let sock = match (net.tcp_connect("127.0.0.1", port)) {
+            Result.Err(e) => panic(e),
+            Result.Ok(s) => s,
+        };
+        let c0 = framing.from_handle(sock);
+        let got = match (protocol.recv_hello(c0)) {
+            Result.Err(e) => Result.Err(e),
+            Result.Ok(pair) => {
+                let (c1, _) = pair;
+                protocol.auth_as_receiver(c1, receiver_pw, seen_hello)
+                    .map(fn(r: (framing.Conn, bytes)) -> bytes {
+                    let (_, k) = r;
+                    k
+                })
+            },
+        };
+        framing.close_conn(c0);
+        send(done, got);
+    });
+    let sock = match (net.tcp_accept(listener)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(s) => s,
+    };
+    close(listener);
+    let c0 = framing.from_handle(sock);
+    let c1 = match (protocol.send_hello(c0, sent_hello)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(c) => c,
+    };
+    let sent = protocol.auth_as_sender(c1, sender_pw, sent_hello)
+        .map(fn(r: (framing.Conn, bytes)) -> bytes {
+        let (_, k) = r;
+        k
+    });
+    framing.close_conn(c0);
+    match (recv(done)) {
+        Option.None => panic("receiver fiber vanished"),
+        Option.Some(got) => (sent, got),
+    }
+}
+
+fn a_hello() -> protocol.Hello {
+    protocol.Hello {
+        sid: crypto.random_bytes(protocol.SID_LEN),
+        file_count: 1,
+        total_size: 10,
+        chunk_size: CHUNK
+    }
+}
+
+@test
+fn the_same_password_agrees_on_a_fresh_key_each_session() {
+    let h = a_hello();
+    let (s1, r1) = handshake("abc", "abc", h, h);
+    let k1 = s1.unwrap();
+    assert_eq(k1, r1.unwrap());
+    assert_eq(k1.len(), 32);
+    // Same password and sid, new ephemeral scalars: another key.
+    let (s2, _) = handshake("abc", "abc", h, h);
+    assert(s2.unwrap() != k1);
+}
+
+@test
+fn a_wrong_password_fails_on_both_sides() {
+    let h = a_hello();
+    let (sent, got) = handshake("abc", "abd", h, h);
+    match (sent) {
+        Result.Ok(_) => panic("the sender must refuse a receiver with another password"),
+        Result.Err(e) => assert(e.contains("wrong password")),
+    }
+    match (got) {
+        Result.Ok(_) => panic("the receiver must not get a key"),
+        Result.Err(e) => assert(e.contains("wrong password")),
+    }
+}
+
+@test
+fn a_hello_altered_in_transit_fails_authentication() {
+    let h = a_hello();
+    let forged = protocol.Hello {
+        sid: h.sid,
+        file_count: h.file_count,
+        total_size: h.total_size + 1,
+        chunk_size: h.chunk_size
+    };
+    let (sent, got) = handshake("abc", "abc", h, forged);
+    assert(sent.is_err());
+    assert(got.is_err());
 }
