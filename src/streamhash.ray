@@ -4,6 +4,7 @@
 // dependía de las fronteras de los trozos. El handle es mutable: `update` lo alimenta
 // en orden y `digest` lo cierra devolviendo los 32 bytes.
 import std/crypto;
+import std/fs;
 import fileread;
 
 /// Opens a fresh incremental SHA-256 hasher.
@@ -38,6 +39,156 @@ pub fn prefix_digest(path: string, len: int, chunk_size: int) -> Result<bytes, s
             Result.Err(e)
         },
         Result.Ok(_) => digest(h),
+    }
+}
+
+/// How many hashers a session keeps open past their prefix (resumed files, one each).
+/// Beyond it the prefix is hashed again when its file streams: a huge batch cut mid-way
+/// must not hold one live hasher per file.
+pub const MAX_KEPT: int = 1024;
+
+/// The hash of a file's first bytes and, when kept, the open hasher that already covers
+/// them, ready to take the rest of the file.
+pub struct Prefix {
+    digest: bytes,
+    kept: Option<int>,
+}
+
+/// SHA-256 of the first `len` bytes of `path`, read once: when `keep`, the hasher stays
+/// open past the prefix (a clone gives the digest), so the full-file hash can go on from
+/// there without reading the prefix again.
+pub fn prefix(path: string, len: int, chunk_size: int, keep: bool) -> Result<Prefix, string> {
+    if (!keep) {
+        return Result.Ok(
+            Prefix { digest: prefix_digest(path, len, chunk_size)?, kept: Option.None }
+        );
+    }
+    let h = init()?;
+    let fed = feed(path, len, chunk_size, h);
+    let fork = match (fed) {
+        Result.Err(e) => Result.Err(e),
+        Result.Ok(_) => crypto.hash_clone(h),
+    };
+    match (fork) {
+        Result.Err(e) => {
+            let _ = digest(h);
+            Result.Err(e)
+        },
+        Result.Ok(c) => match (digest(c)) {
+            Result.Err(e) => {
+                let _ = digest(h);
+                Result.Err(e)
+            },
+            Result.Ok(d) => Result.Ok(Prefix { digest: d, kept: Option.Some(h) }),
+        },
+    }
+}
+
+/// Hashers kept open past a prefix, by file index (`prefix(..., keep = true)`).
+pub struct Kept {
+    open: Map<int, int>,
+}
+
+pub fn kept() -> Kept {
+    let m: Map<int, int> = Map.new();
+    Kept { open: m }
+}
+
+pub fn has_room(k: Kept) -> bool {
+    k.open.len() < MAX_KEPT
+}
+
+pub fn hold(k: Kept, index: int, p: Prefix) {
+    if let Option.Some(h) = p.kept {
+        k.open.insert(index, h);
+    }
+}
+
+/// The hasher for file `index` positioned after its first `start` bytes: the kept one,
+/// or a fresh one fed with that prefix of `path`.
+pub fn resume_from(
+    k: Kept,
+    index: int,
+    path: string,
+    start: int,
+    chunk_size: int
+) -> Result<int, string> {
+    if (start > 0) {
+        if let Option.Some(h) = k.open.get(index) {
+            k.open.remove(index);
+            return Result.Ok(h);
+        }
+    }
+    drop(k, index);
+    let h = init()?;
+    if (start > 0) {
+        match (feed(path, start, chunk_size, h)) {
+            Result.Err(e) => {
+                let _ = digest(h);
+                return Result.Err(e);
+            },
+            Result.Ok(_) => { },
+        }
+    }
+    Result.Ok(h)
+}
+
+/// Closes the kept hasher of file `index`, if any (its prefix will not be used).
+pub fn drop(k: Kept, index: int) {
+    if let Option.Some(h) = k.open.get(index) {
+        k.open.remove(index);
+        let _ = digest(h);
+    }
+}
+
+/// Closes every hasher still kept (the session ended, well or not).
+pub fn release(k: Kept) {
+    for index in k.open.keys() {
+        drop(k, index);
+    }
+}
+
+@test
+fn a_kept_prefix_hashes_on_without_reading_it_again() {
+    match (fs.make_temp_dir("takeit_streamhash_")) {
+        Result.Err(e) => panic(e),
+        Result.Ok(dir) => {
+            let path = dir + "/f";
+            let _ = fs.write_file_bytes(path, b"0123456789abcdef");
+            let p = prefix(path, 10, 4, true).unwrap();
+            assert(p.digest == crypto.sha256(b"0123456789"));
+            let k = kept();
+            hold(k, 7, p);
+            // The file changes after the prefix was read: the kept hasher does not reread.
+            let _ = fs.write_file_bytes(path, b"XXXXXXXXXXabcdef");
+            let h = resume_from(k, 7, path, 10, 4).unwrap();
+            let _ = update(h, b"abcdef");
+            assert(digest(h).unwrap() == crypto.sha256(b"0123456789abcdef"));
+            assert_eq(k.open.len(), 0);
+            // Without a kept hasher, the prefix is read from the file.
+            let fresh = resume_from(k, 3, path, 10, 4).unwrap();
+            assert(digest(fresh).unwrap() == crypto.sha256(b"XXXXXXXXXX"));
+            let _ = fs.remove_all(dir);
+        },
+    }
+}
+
+@test
+fn release_closes_what_was_never_used() {
+    match (fs.make_temp_dir("takeit_streamhash_")) {
+        Result.Err(e) => panic(e),
+        Result.Ok(dir) => {
+            let path = dir + "/f";
+            let _ = fs.write_file_bytes(path, b"abc");
+            let k = kept();
+            hold(k, 0, prefix(path, 3, 4, true).unwrap());
+            hold(k, 1, prefix(path, 2, 4, true).unwrap());
+            hold(k, 2, prefix(path, 2, 4, false).unwrap());
+            assert_eq(k.open.len(), 2);
+            release(k);
+            assert_eq(k.open.len(), 0);
+            let _ = fs.remove_all(dir);
+        },
     }
 }
 

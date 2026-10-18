@@ -189,15 +189,23 @@ fn partial_size(tmp: string) -> Result<int, string> {
     }
 }
 
-/// What this side offers to resume for one entry: the partial's length when it can be a
-/// prefix of the file (0 otherwise), with the SHA-256 of those bytes.
-fn offer_for(tmp: string, size: int, resume: bool) -> Result<protocol.Held, string> {
+/// What this side offers to resume for entry `index`: the partial's length when it can be
+/// a prefix of the file (0 otherwise), with the SHA-256 of those bytes. The hasher that
+/// read them is kept in `k` for when the file's tail arrives.
+fn offer_for(
+    tmp: string,
+    index: int,
+    size: int,
+    resume: bool,
+    k: streamhash.Kept
+) -> Result<protocol.Held, string> {
     let held = partial_size(tmp)?;
     if (!resume || held == 0 || held > size) {
         return Result.Ok(protocol.Held { offset: 0, digest: crypto.sha256(b"") });
     }
-    let d = streamhash.prefix_digest(tmp, held, protocol.DEFAULT_CHUNK)?;
-    Result.Ok(protocol.Held { offset: held, digest: d })
+    let p = streamhash.prefix(tmp, held, protocol.DEFAULT_CHUNK, streamhash.has_room(k))?;
+    streamhash.hold(k, index, p);
+    Result.Ok(protocol.Held { offset: held, digest: p.digest })
 }
 
 /// A failure while receiving one file; `discard` = its partial is proven bad (digest or
@@ -283,7 +291,8 @@ fn receive_one(
     p: Plan,
     i: int,
     entry: protocol.Entry,
-    start: int
+    start: int,
+    k: streamhash.Kept
 ) -> Result<(Progress, bytes), string> {
     let final_path = p.finals[i];
     let tmp = partial_path(final_path);
@@ -302,22 +311,14 @@ fn receive_one(
         return Result.Err("${tmp} changed during the transfer");
     }
     let fh = fs.open(tmp, if (start > 0) { "a" } else { "w" })?;
-    let hh = match (streamhash.init()) {
+    let hh = match (streamhash.resume_from(k, i, tmp, start, protocol.DEFAULT_CHUNK)) {
         Result.Err(e) => {
             let _ = close(fh);
             return Result.Err(e);
         },
         Result.Ok(h) => h,
     };
-    let fed = if (start > 0) {
-        streamhash.feed(tmp, start, protocol.DEFAULT_CHUNK, hh)
-    } else {
-        Result.Ok(0)
-    };
-    let outcome = match (fed) {
-        Result.Err(e) => Result.Err(Fail { msg: e, discard: false }),
-        Result.Ok(_) => pump(s, i, entry, start, fh, hh),
-    };
+    let outcome = pump(s, i, entry, start, fh, hh);
     let _ = close(fh);
     match (outcome) {
         Result.Ok(pair) => Result.Ok(pair),
@@ -347,13 +348,27 @@ pub fn receive_files(
     let (l1, mblob) = protocol.recv_blob(l0, protocol.KIND_MANIFEST)?;
     let entries = protocol.decode_manifest(mblob, hello)?;
     check_local_names(entries)?;
-    let n = entries.len();
     let p = plan(entries, out);
+    let k = streamhash.kept();
+    let outcome = offer_and_receive(l1, hello, entries, p, resume, k);
+    streamhash.release(k);
+    outcome
+}
+
+fn offer_and_receive(
+    l1: protocol.Link,
+    hello: protocol.Hello,
+    entries: [protocol.Entry],
+    p: Plan,
+    resume: bool,
+    k: streamhash.Kept
+) -> Result<Received, string> {
+    let n = entries.len();
     var offers: [protocol.Held] = [];
     var i = 0;
     while (i < n) {
         check_confined(p, p.finals[i])?;
-        offers.push(offer_for(partial_path(p.finals[i]), entries[i].size, resume)?);
+        offers.push(offer_for(partial_path(p.finals[i]), i, entries[i].size, resume, k)?);
         i = i + 1;
     }
     let l2 = protocol.send_blob(l1, protocol.KIND_RESUME, protocol.encode_resume(offers))?;
@@ -368,6 +383,9 @@ pub fn receive_files(
             return Result.Err(
                 "sender wants ${entries[i].path} from byte ${starts[i]}, but ${offers[i].offset} are held"
             );
+        }
+        if (starts[i] == 0) {
+            streamhash.drop(k, i);
         }
         resumed = resumed + starts[i];
         i = i + 1;
@@ -385,7 +403,7 @@ pub fn receive_files(
     i = 0;
     while (i < n) {
         st.meter.label = send.label("receiving", i, n, entries[i].path);
-        match (receive_one(st, p, i, entries[i], starts[i])) {
+        match (receive_one(st, p, i, entries[i], starts[i], k)) {
             Result.Err(e) => {
                 let _ = streamhash.digest(session);
                 return Result.Err(e + kept_hint(p));
