@@ -40,7 +40,7 @@ Comparte la contraseña por un canal aparte (chat, voz, SMS). Quien no la tenga 
 | Barra de progreso en stderr (`sending` / `receiving`) | ✅ listo |
 | Timeouts de idle en accept/lectura (`--timeout`, default 120 s) | ✅ listo |
 | Puerto libre automático (`--port 0` / omitido en send) | ✅ listo |
-| Binarios nativos (Linux, macOS, Windows; x86_64 y ARM64) + `install.sh` + CI de releases | ✅ listo |
+| Binarios nativos (Linux, macOS, Windows; x86_64 y ARM64) + `install.sh` / `install.ps1` + CI de releases | ✅ listo |
 | Tests (`roundtrip_test`, `chunk_review_test`) | ✅ listo |
 | Reanudación de una transferencia cortada, por archivo (solo se envía lo que falta) | ✅ listo |
 | Manifiesto cifrado, rutas confinadas al directorio de salida | ✅ listo |
@@ -82,9 +82,24 @@ TAKEIT_VERSION=v0.2.0 curl -sSfL https://raw.githubusercontent.com/ray-language/
 
 ### Windows
 
-`install.sh` es para Linux y macOS. En Windows, descarga `takeit-x86_64-pc-windows-msvc.zip` (o
-`takeit-aarch64-pc-windows-msvc.zip` en ARM64) de la [última Release](https://github.com/ray-language/takeit/releases/latest),
-descomprime `takeit.exe` en una carpeta del `PATH` y úsalo igual desde PowerShell o `cmd`.
+En PowerShell (Windows PowerShell 5.1 o PowerShell 7):
+
+```powershell
+irm https://raw.githubusercontent.com/ray-language/takeit/master/install.ps1 | iex
+```
+
+Detecta x86_64 o ARM64 (la del sistema, también desde un PowerShell emulado), descarga
+`takeit-<target>.zip` de la [última Release](https://github.com/ray-language/takeit/releases/latest),
+verifica su `.sha256`, deja `takeit.exe` en `%LOCALAPPDATA%\Programs\takeit` y añade esa carpeta
+al `PATH` del usuario (las terminales nuevas lo ven; la actual ya lo tiene). Después se usa igual
+desde PowerShell o `cmd`. Acepta las mismas variables que `install.sh` (`TAKEIT_VERSION`,
+`TAKEIT_BIN_DIR`, `TAKEIT_REPO`, `TAKEIT_DRY_RUN`) y `TAKEIT_NO_PATH` para no tocar el `PATH`:
+
+```powershell
+$env:TAKEIT_VERSION = 'v0.4.0'; irm https://raw.githubusercontent.com/ray-language/takeit/master/install.ps1 | iex
+```
+
+A mano: descomprime el `.zip` de la Release en una carpeta del `PATH`.
 
 - **Firewall**: quien ejecuta `takeit send` escucha conexiones. La primera vez, Windows pregunta si
   permite el acceso a `takeit.exe`; sin ese permiso el receptor se queda en `connect timeout`.
