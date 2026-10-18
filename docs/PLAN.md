@@ -109,8 +109,12 @@ contraseña nueva) los aprovecha:
    (`fileread.for_each_chunk_from`); si no (otro archivo con el mismo nombre, una cola rota
    tras un corte de luz), desde 0 y el receptor trunca.
 3. FileDone lleva el SHA-256 del archivo **completo**: ambos lados alimentan su hasher con el
-   prefijo antes de la cola (`streamhash.feed`). El prefijo se lee dos veces (para la oferta y
-   para el hash final), porque el hasher no se puede bifurcar y no conviene tener N abiertos.
+   prefijo antes de la cola. El prefijo se lee **una vez**: el hasher que calculó la oferta (o
+   la comprobación del emisor) se bifurca con `crypto.hash_clone` (raylang 1.27.64), el clon da
+   el digest y el original sigue abierto hasta la cola (`streamhash.prefix` / `resume_from`).
+   Como mucho `streamhash.MAX_KEPT` (1024) hashers abiertos por sesión; los archivos que pasan
+   de ahí vuelven a leer su prefijo. Con 1,2 GiB reanudados de 1,5 GiB, la sesión baja de ~1,95 s
+   a ~1,43 s en local.
 
 Un parcial solo se borra si falla su verificación (digest o tamaño). El progreso cuenta lo
 reanudado en el porcentaje pero no en la velocidad ni en el ETA (`progress.start_from`).

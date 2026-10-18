@@ -120,16 +120,25 @@ fn describe(files: [sources.Source], sent: Sent) -> string {
     what + " (" + progress.format_bytes(sent.total) + note + ")"
 }
 
-/// Where file `s` starts: the receiver's offset when its prefix matches this file byte
-/// for byte, 0 otherwise (another file, a torn tail, an offset past the end).
-fn agree(s: sources.Source, held: protocol.Held, chunk: int) -> Result<int, string> {
+/// Where file `s` (number `index`) starts: the receiver's offset when its prefix matches
+/// this file byte for byte, 0 otherwise (another file, a torn tail, an offset past the
+/// end). On a match the prefix's hasher is kept in `k`, so streaming does not read it again.
+fn agree(
+    s: sources.Source,
+    index: int,
+    held: protocol.Held,
+    chunk: int,
+    k: streamhash.Kept
+) -> Result<int, string> {
     if (held.offset == 0 || held.offset > s.entry.size) {
         return Result.Ok(0);
     }
-    let prefix = streamhash.prefix_digest(s.local, held.offset, chunk)?;
-    if (crypto.constant_time_eq(prefix, held.digest)) {
+    let p = streamhash.prefix(s.local, held.offset, chunk, streamhash.has_room(k))?;
+    streamhash.hold(k, index, p);
+    if (crypto.constant_time_eq(p.digest, held.digest)) {
         Result.Ok(held.offset)
     } else {
+        streamhash.drop(k, index);
         Result.Ok(0)
     }
 }
@@ -166,12 +175,28 @@ pub fn stream_files(
     let (l1, offer) = protocol.recv_blob(l, protocol.KIND_RESUME)?;
     l = l1;
     let held = protocol.decode_resume(offer, n)?;
+    let k = streamhash.kept();
+    let outcome = agree_and_stream(l, files, held, chunk, total, k);
+    streamhash.release(k);
+    outcome
+}
+
+fn agree_and_stream(
+    link: protocol.Link,
+    files: [sources.Source],
+    held: [protocol.Held],
+    chunk: int,
+    total: int,
+    k: streamhash.Kept
+) -> Result<Sent, string> {
+    let n = files.len();
+    var l = link;
     var starts: [int] = [];
     var resumed = 0;
     var mismatched = 0;
     var i = 0;
     while (i < n) {
-        let s = agree(files[i], held[i], chunk)?;
+        let s = agree(files[i], i, held[i], chunk, k)?;
         if (s == 0 && held[i].offset > 0) {
             mismatched = mismatched + 1;
         }
@@ -206,10 +231,7 @@ pub fn stream_files(
         }
         meter.label = label("sending", i, n, src.entry.path);
         l = protocol.seal(l, index, protocol.KIND_FILE_BEGIN, protocol.be32(index))?;
-        let hh = streamhash.init()?;
-        if (start > 0) {
-            streamhash.feed(src.local, start, chunk, hh)?;
-        }
+        let hh = streamhash.resume_from(k, index, src.local, start, chunk)?;
         var send_err = "";
         let read = fileread.for_each_chunk_from(src.local, start, chunk, fn(piece: bytes) -> Result<int, string> {
             if (send_err.len() > 0) {
