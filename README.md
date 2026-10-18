@@ -2,7 +2,7 @@
 
 Transferencia de archivos **peer-to-peer** con cifrado de extremo a extremo, escrita en [raylang](https://github.com/ray-language/raylang).
 
-**Versión actual: `0.4.0` (protocolo v5).** Un equipo envía archivos o carpetas; el otro recibe. No hay cuenta, no hay servidor en la nube, no hay intermediario que vea el contenido: solo TCP, una contraseña de un solo uso, un PAKE (CPace) y AEAD (ChaCha20-Poly1305).
+**Versión actual: `0.4.1` (protocolo v5).** Un equipo envía archivos o carpetas; el otro recibe. No hay cuenta, no hay servidor en la nube, no hay intermediario que vea el contenido: solo TCP, una contraseña de un solo uso, un PAKE (CPace) y AEAD (ChaCha20-Poly1305).
 
 ```text
 # Emisor
