@@ -25,7 +25,8 @@ case "$os" in
   Linux)  suffix="unknown-linux-gnu" ;;
   Darwin) suffix="apple-darwin" ;;
   MINGW*|MSYS*|CYGWIN*)
-    err "takeit ships Linux and macOS binaries. On Windows, use WSL." ;;
+    err "this script is for Linux and macOS. On Windows, in PowerShell:
+       irm https://raw.githubusercontent.com/ray-language/takeit/master/install.ps1 | iex" ;;
   *) err "unsupported operating system: $os" ;;
 esac
 case "$arch" in

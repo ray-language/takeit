@@ -68,3 +68,50 @@ jobs:
       - name: Tests (native)
         shell: bash
         run: ray test --native
+
+  # The installers against the latest published Release: each one must pick this
+  # runner's asset, verify it and leave a takeit that runs. Into a scratch directory,
+  # without touching the PATH.
+  install:
+    name: install ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
+          - { os: macos-14,       target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.sh
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          export TAKEIT_BIN_DIR="$RUNNER_TEMP/takeit-bin"
+          sh install.sh | tee install.log
+          grep -q "takeit · ${{ matrix.target }}" install.log
+          grep -q "checksum ok" install.log
+          # Without arguments takeit prints its usage and exits 1.
+          usage="$("$TAKEIT_BIN_DIR/takeit" 2>&1 || true)"
+          echo "$usage" | grep -q "takeit send"
+          echo "takeit runs"
+      # Windows PowerShell 5.1 (`powershell`), the one every Windows has, run the way
+      # users do: the script's text through Invoke-Expression.
+      - name: install.ps1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $env:TAKEIT_BIN_DIR = Join-Path $env:RUNNER_TEMP 'takeit-bin'
+          $env:TAKEIT_NO_PATH = '1'
+          $log = Get-Content -Raw install.ps1 | Invoke-Expression 6>&1 | Out-String
+          Write-Host $log
+          if ($log -notmatch [regex]::Escape("takeit - ${{ matrix.target }}")) { throw 'wrong target' }
+          if ($log -notmatch 'checksum ok') { throw 'checksum not verified' }
+          $exe = Join-Path $env:TAKEIT_BIN_DIR 'takeit.exe'
+          $usage = cmd /c "`"$exe`" 2>&1"
+          if (($usage | Out-String) -notmatch 'takeit send') { throw 'takeit.exe did not run' }
+          Write-Host 'takeit.exe runs'
+          # takeit.exe without arguments exits 1; the step ends with `exit $LASTEXITCODE`.
+          exit 0
