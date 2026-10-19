@@ -15,6 +15,13 @@ import progress;
 
 pub const DEFAULT_PORT: int = 7440;
 
+/// The relay used when neither `--relay` nor TAKEIT_RELAY names one; empty = none, and
+/// takeit connects directly. Set it to a name (not an IP) so the server can move.
+pub const BUILT_IN: string = "";
+
+/// The variable that names a relay for every command, without `--relay`.
+pub const ENV_VAR: string = "TAKEIT_RELAY";
+
 /// A control line longer than this is not a rayrelay talking.
 const MAX_LINE: int = 128;
 
@@ -77,6 +84,44 @@ fn with_port(host: string, port_s: string) -> Result<Addr, string> {
         },
         Option.None => Result.Err("relay address: invalid port: ${port_s}"),
     }
+}
+
+/// Which relay a command uses: `--relay` first, then TAKEIT_RELAY, then BUILT_IN; None
+/// means a direct connection. `direct` (`--direct`, or flags only a direct connection
+/// takes) skips the configured ones, and only clashes with an explicit `--relay`.
+pub fn choose(direct: bool, flag: Option<string>) -> Result<Option<Addr>, string> {
+    choose_from(direct, flag, env(ENV_VAR), BUILT_IN)
+}
+
+fn choose_from(
+    direct: bool,
+    flag: Option<string>,
+    env_value: Option<string>,
+    built_in: string
+) -> Result<Option<Addr>, string> {
+    if let Option.Some(raw) = flag {
+        if (direct) {
+            return Result.Err(
+                "--relay cannot go with --direct, --bind, --port, --host or --password"
+            );
+        }
+        return Result.Ok(Option.Some(parse_addr(raw)?));
+    }
+    if (direct) {
+        return Result.Ok(Option.None);
+    }
+    if let Option.Some(raw) = env_value {
+        if (raw.trim().len() > 0) {
+            return match (parse_addr(raw)) {
+                Result.Ok(a) => Result.Ok(Option.Some(a)),
+                Result.Err(e) => Result.Err("${ENV_VAR}: ${e}"),
+            };
+        }
+    }
+    if (built_in.len() > 0) {
+        return Result.Ok(Option.Some(parse_addr(built_in)?));
+    }
+    Result.Ok(Option.None)
 }
 
 /// How the address reads back, for messages (`host:port`, IPv6 in brackets).
@@ -251,4 +296,28 @@ fn a_joined_code_splits_back_whatever_its_grouping() {
     assert_eq(regrouped.password, code.password);
     assert(split_code("rsp3-zceb").is_err());
     assert(split_code(joined + "0").is_err());
+}
+
+@test
+fn the_flag_beats_the_variable_and_the_variable_beats_the_built_in() {
+    let flag = choose_from(false, Option.Some("a.example"), Option.Some("b.example"), "c.example");
+    assert_eq(flag.unwrap().unwrap().host, "a.example");
+    let from_env = choose_from(false, Option.None, Option.Some("b.example:9"), "c.example");
+    assert_eq(from_env.unwrap().unwrap().port, 9);
+    let built = choose_from(false, Option.None, Option.Some("  "), "c.example");
+    assert_eq(built.unwrap().unwrap().host, "c.example");
+    assert(choose_from(false, Option.None, Option.None, "").unwrap().is_none());
+}
+
+@test
+fn direct_skips_the_configured_relays_but_clashes_with_the_flag() {
+    assert(choose_from(true, Option.None, Option.Some("b.example"), "c.example")
+        .unwrap()
+        .is_none());
+    assert(choose_from(true, Option.Some("a.example"), Option.None, "").is_err());
+    let bad = choose_from(false, Option.None, Option.Some("host:http"), "");
+    match (bad) {
+        Result.Ok(_) => panic("a malformed variable is an error"),
+        Result.Err(e) => assert(e.starts_with(ENV_VAR)),
+    }
 }

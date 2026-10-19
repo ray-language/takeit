@@ -2,7 +2,7 @@
 
 Transferencia de archivos **peer-to-peer** con cifrado de extremo a extremo, escrita en [raylang](https://github.com/ray-language/raylang).
 
-**Versión actual: `0.5.0` (protocolo v5).** Un equipo envía archivos o carpetas; el otro recibe. No hay cuenta, no hay servidor en la nube, no hay intermediario que vea el contenido: solo TCP, una contraseña de un solo uso, un PAKE (CPace) y AEAD (ChaCha20-Poly1305).
+**Versión actual: `0.6.0` (protocolo v5).** Un equipo envía archivos o carpetas; el otro recibe. No hay cuenta, no hay servidor en la nube, no hay intermediario que vea el contenido: solo TCP, una contraseña de un solo uso, un PAKE (CPace) y AEAD (ChaCha20-Poly1305).
 
 ```text
 # Emisor
@@ -36,11 +36,14 @@ Si los dos equipos no se ven (NAT, firewalls), se encuentran a través de un
 $ takeit send ./informe.pdf --relay relay.example.com
 Code: pk65-xg2s-596e-f044-7391-c1b2
 Waiting on the relay relay.example.com …
-Receiver should run: takeit recv --relay relay.example.com --code pk65-xg2s-596e-f044-7391-c1b2
+Receiver should run: takeit recv pk65-xg2s-596e-f044-7391-c1b2 --relay relay.example.com
 
-$ takeit recv --relay relay.example.com --code pk65-xg2s-596e-f044-7391-c1b2
+$ takeit recv pk65-xg2s-596e-f044-7391-c1b2 --relay relay.example.com
 Saved: ./informe.pdf (1.2 MiB)
 ```
+
+Con `TAKEIT_RELAY=relay.example.com` en el entorno, `--relay` sobra: `takeit send ./informe.pdf` y
+`takeit recv <código>`.
 
 ## Estado actual
 
@@ -143,9 +146,9 @@ ray test
 ## Uso
 
 ```text
-takeit send <file|dir>... [--bind HOST] [--port N] [--relay ADDR] [--timeout SECS]
+takeit send <file|dir>... [--relay ADDR | --direct [--bind HOST] [--port N]] [--timeout SECS]
+takeit recv CODE [--relay ADDR] [--out PATH] [--timeout SECS] [--fresh]
 takeit recv --host HOST --port N --password PASS [--out PATH] [--timeout SECS] [--fresh]
-takeit recv --relay ADDR --code CODE [--out PATH] [--timeout SECS] [--fresh]
 ```
 
 | Flag | Quién | Qué hace |
@@ -155,7 +158,8 @@ takeit recv --relay ADDR --code CODE [--out PATH] [--timeout SECS] [--fresh]
 | `--host` | recv | IP o hostname del emisor |
 | `--password` | recv | Contraseña mostrada por el emisor |
 | `--relay` | send / recv | Encontrarse a través de un rayrelay en `HOST[:PORT]` (puerto por defecto `7440`; IPv6 como `[::1]:7440`) |
-| `--code` | recv | Con `--relay`: el código que mostró el emisor (guiones, espacios y mayúsculas dan igual) |
+| `--direct` | send / recv | Sin relay aunque haya uno configurado; `--bind`, `--port`, `--host` y `--password` lo implican |
+| `CODE` | recv | Modo relay: el código que mostró el emisor (también `--code CODE`; guiones, espacios y mayúsculas dan igual) |
 | `--out` | recv | Directorio de destino (default: el actual; se crea si falta). Con un solo archivo puede ser el archivo destino |
 | `--timeout` | ambos | Segundos de idle en accept/lectura; `0` = sin límite (default `120`) |
 | `--fresh` | recv | Ignora los parciales de una transferencia cortada y empieza de cero |
@@ -164,7 +168,10 @@ Durante la transferencia, stderr muestra progreso (`sending` / `receiving` con %
 
 ### A través de un relay
 
-Con `--relay`, ninguno de los dos escucha: ambos se conectan al relay, que los empareja y copia
+Qué relay se usa, por orden: `--relay`, la variable `TAKEIT_RELAY`, y el relay de fábrica del
+binario (hoy ninguno). Si no hay ninguno, o con `--direct`, la conexión es directa.
+
+Con un relay, ninguno de los dos escucha: ambos se conectan al relay, que los empareja y copia
 bytes a ciegas. El código que imprime el emisor es el del relay (`pk65-xg2s`, 8 caracteres) seguido
 de la contraseña de la sesión; `takeit recv` solo le manda al relay la primera parte. El relay no
 puede descifrar ni probar contraseñas (CPace), pero sí ve el hello en claro (número de archivos y

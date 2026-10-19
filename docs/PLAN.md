@@ -129,7 +129,7 @@ reanudado en el porcentaje pero no en la velocidad ni en el ETA (`progress.start
 | 3 | hello + auth | ✅ |
 | 4 | send/recv archivo | ✅ |
 | 5 | progreso, timeouts | ✅ |
-| 6 | relay / códigos cortos (`--relay`, vía rayrelay; código unido relay + contraseña) | ✅ (hole punching UDP: pendiente) |
+| 6 | relay / códigos cortos (`--relay` / `TAKEIT_RELAY` / relay de fábrica, vía rayrelay; código unido relay + contraseña) | ✅ (hole punching UDP: pendiente) |
 | 7 | `ray build --native -o takeit --release` | ✅ (CI de releases multi-target) |
 | 8 | multi-archivo (protocolo v4) | ✅ → [`PROTOCOL_V5.md`](PROTOCOL_V5.md) |
 | 9 | resume de transferencia | ✅ por archivo, dentro de v4 (ver arriba) |

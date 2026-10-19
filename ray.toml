@@ -1,6 +1,6 @@
 [package]
 name = "takeit"
-version = "0.5.0"
+version = "0.6.0"
 raylang = "1.27.65"
 
 [dependencies]

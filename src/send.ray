@@ -136,7 +136,7 @@ fn through_relay(
     let at = relay.show_addr(a);
     print("Code: " + joined);
     print("Waiting on the relay " + at + " …");
-    print("Receiver should run: takeit recv --relay " + at + " --code " + joined);
+    print("Receiver should run: takeit recv " + joined + " --relay " + at);
     announce(count, total, timeout_ms);
     match (relay.wait_peer(c)) {
         Result.Ok(c1) => Result.Ok(c1),
