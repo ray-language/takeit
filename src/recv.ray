@@ -9,6 +9,7 @@ import progress;
 import streamhash;
 import paths;
 import send;
+import relay;
 
 pub struct RecvOpts {
     host: string,
@@ -18,20 +19,19 @@ pub struct RecvOpts {
     timeout_ms: int,
     /// Resume from the `*.takeit.partial` files an interrupted transfer left (default).
     resume: bool,
+    /// Join the sender through this rayrelay (`host`/`port` unused), under `relay_code`.
+    relay: Option<relay.Addr>,
+    relay_code: string,
 }
 
 pub fn run(opts: RecvOpts) -> int {
-    // tcp_connect_timeout (raylang M122): a hung or dropping host fails fast instead of
-    // parking the connect forever. Reuse the idle timeout; fall back to 10s when disabled.
-    let connect_ms = if (opts.timeout_ms > 0) { opts.timeout_ms } else { 10000 };
-    let sock = match (net.tcp_connect_timeout(opts.host, opts.port, connect_ms)) {
+    let c0 = match (connect(opts)) {
         Result.Err(e) => {
-            eprint("could not connect: " + e);
+            eprint(e);
             return 1;
         },
-        Result.Ok(s) => s,
+        Result.Ok(c) => c,
     };
-    let c0 = framing.set_timeout(framing.from_handle(sock), opts.timeout_ms);
     let outcome = match (protocol.recv_hello(c0)) {
         Result.Err(e) => Result.Err(e),
         Result.Ok(pair) => {
@@ -68,6 +68,20 @@ pub fn run(opts: RecvOpts) -> int {
             print("Saved: " + got.dest + " (" + progress.format_bytes(got.total) + note + ")");
             0
         },
+    }
+}
+
+/// Reaches the sender, directly or through the relay.
+fn connect(opts: RecvOpts) -> Result<framing.Conn, string> {
+    if let Option.Some(a) = opts.relay {
+        return relay.join(a, opts.relay_code, opts.timeout_ms);
+    }
+    // tcp_connect_timeout (raylang M122): a hung or dropping host fails fast instead of
+    // parking the connect forever. Reuse the idle timeout; fall back to 10s when disabled.
+    let connect_ms = if (opts.timeout_ms > 0) { opts.timeout_ms } else { 10000 };
+    match (net.tcp_connect_timeout(opts.host, opts.port, connect_ms)) {
+        Result.Err(e) => Result.Err("could not connect: " + e),
+        Result.Ok(s) => Result.Ok(framing.set_timeout(framing.from_handle(s), opts.timeout_ms)),
     }
 }
 

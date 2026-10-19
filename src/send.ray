@@ -9,12 +9,15 @@ import progress;
 import streamhash;
 import fileread;
 import sources;
+import relay;
 
 pub struct SendOpts {
     paths: [string],
     bind: string,
     port: int,
     timeout_ms: int,
+    /// Meet the receiver through this rayrelay instead of listening.
+    relay: Option<relay.Addr>,
 }
 
 /// A finished session: how many files, their total size, how much of it the receiver
@@ -39,44 +42,14 @@ pub fn run(opts: SendOpts) -> int {
     }
     let files = collected.sources;
     let total = sources.total_size(files);
-    let listener = match (net.tcp_listen(opts.bind, opts.port)) {
-        Result.Err(e) => {
-            eprint("could not listen: " + e);
-            return 1;
-        },
-        Result.Ok(l) => l,
-    };
-    let port = net.local_port(listener);
     let pw = password.generate();
-    print("Password: " + pw);
-    print("Waiting on " + opts.bind + ":" + to_string(port) + " …");
-    print(
-        "Receiver should run: takeit recv --host <this-ip> --port "
-            + to_string(port)
-            + " --password "
-            + pw
-    );
-    if (files.len() > 1) {
-        print("(" + to_string(files.len()) + " files, " + progress.format_bytes(total) + ")");
-    }
-    if (opts.timeout_ms > 0) {
-        eprint("(idle/accept timeout: " + to_string(opts.timeout_ms / 1000) + "s)");
-        net.set_read_timeout(listener, opts.timeout_ms);
-    }
-    let sock = match (net.tcp_accept(listener)) {
+    let c0 = match (rendezvous(opts, pw, files.len(), total)) {
         Result.Err(e) => {
-            if (e == "read timeout") {
-                eprint("timed out waiting for receiver");
-            } else {
-                eprint("accept: " + progress.map_io_err(e));
-            }
-            close(listener);
+            eprint(e);
             return 1;
         },
-        Result.Ok(s) => s,
+        Result.Ok(c) => c,
     };
-    close(listener);
-    let c0 = framing.set_timeout(framing.from_handle(sock), opts.timeout_ms);
     let hello = protocol.Hello {
         sid: crypto.random_bytes(protocol.SID_LEN),
         file_count: files.len(),
@@ -103,6 +76,87 @@ pub fn run(opts: SendOpts) -> int {
             print("Sent: " + describe(files, sent));
             0
         },
+    }
+}
+
+/// Waits for the receiver — on a socket of its own or through the relay — after telling
+/// the user what the receiver must run. Returns the connection to the receiver.
+fn rendezvous(opts: SendOpts, pw: string, count: int, total: int) -> Result<framing.Conn, string> {
+    match (opts.relay) {
+        Option.Some(a) => through_relay(a, opts.timeout_ms, pw, count, total),
+        Option.None => direct(opts, pw, count, total),
+    }
+}
+
+fn direct(opts: SendOpts, pw: string, count: int, total: int) -> Result<framing.Conn, string> {
+    let listener = match (net.tcp_listen(opts.bind, opts.port)) {
+        Result.Err(e) => {
+            return Result.Err("could not listen: " + e);
+        },
+        Result.Ok(l) => l,
+    };
+    let port = net.local_port(listener);
+    print("Password: " + pw);
+    print("Waiting on " + opts.bind + ":" + to_string(port) + " …");
+    print(
+        "Receiver should run: takeit recv --host <this-ip> --port "
+            + to_string(port)
+            + " --password "
+            + pw
+    );
+    announce(count, total, opts.timeout_ms);
+    if (opts.timeout_ms > 0) {
+        net.set_read_timeout(listener, opts.timeout_ms);
+    }
+    let accepted = net.tcp_accept(listener);
+    close(listener);
+    match (accepted) {
+        Result.Err(e) => {
+            if (e == "read timeout") {
+                Result.Err("timed out waiting for receiver")
+            } else {
+                Result.Err("accept: " + progress.map_io_err(e))
+            }
+        },
+        Result.Ok(sock) => Result.Ok(framing.set_timeout(framing.from_handle(sock), opts.timeout_ms)),
+    }
+}
+
+/// The relay hands out the code; the receiver quotes it joined to the password, which
+/// never reaches the relay.
+fn through_relay(
+    a: relay.Addr,
+    timeout_ms: int,
+    pw: string,
+    count: int,
+    total: int
+) -> Result<framing.Conn, string> {
+    let (c, code) = relay.open_host(a, timeout_ms)?;
+    let joined = relay.joined_code(code, pw);
+    let at = relay.show_addr(a);
+    print("Code: " + joined);
+    print("Waiting on the relay " + at + " …");
+    print("Receiver should run: takeit recv --relay " + at + " --code " + joined);
+    announce(count, total, timeout_ms);
+    match (relay.wait_peer(c)) {
+        Result.Ok(c1) => Result.Ok(c1),
+        Result.Err(e) => {
+            framing.close_conn(c);
+            if (e == progress.map_io_err("read timeout")) {
+                Result.Err("timed out waiting for receiver")
+            } else {
+                Result.Err(e)
+            }
+        },
+    }
+}
+
+fn announce(count: int, total: int, timeout_ms: int) {
+    if (count > 1) {
+        print("(" + to_string(count) + " files, " + progress.format_bytes(total) + ")");
+    }
+    if (timeout_ms > 0) {
+        eprint("(idle/accept timeout: " + to_string(timeout_ms / 1000) + "s)");
     }
 }
 

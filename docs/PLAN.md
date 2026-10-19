@@ -11,7 +11,7 @@ CLI peer-to-peer: un equipo **envía** archivos o carpetas y otro **recibe** con
 | Quién escucha | Emisor (`send` hace `tcp_listen`) |
 | Contraseña | 8 bytes CSPRNG → hex agrupado `xxxx-xxxx-xxxx-xxxx` |
 | Chunk | 256 KiB |
-| Alcance | P2P directo (sin relay/NAT traversal) |
+| Alcance | P2P directo, o a través de un rayrelay ciego (`--relay`); sin hole punching |
 | I/O | Streaming: `fs.read_bytes`/`fs.seek` (M113) vía `fileread`; escritura por handle (`fs.write_bytes`) + `fs.sync` + rename atómico |
 | Integridad | SHA-256 real del texto plano con el hasher incremental (M126; v1 usaba un hash encadenado) |
 | Transporte | TCP crudo + AEAD de aplicación (TLS opcional más adelante) |
@@ -129,7 +129,7 @@ reanudado en el porcentaje pero no en la velocidad ni en el ETA (`progress.start
 | 3 | hello + auth | ✅ |
 | 4 | send/recv archivo | ✅ |
 | 5 | progreso, timeouts | ✅ |
-| 6 | relay / códigos cortos (opcional) | pendiente |
+| 6 | relay / códigos cortos (`--relay`, vía rayrelay; código unido relay + contraseña) | ✅ (hole punching UDP: pendiente) |
 | 7 | `ray build --native -o takeit --release` | ✅ (CI de releases multi-target) |
 | 8 | multi-archivo (protocolo v4) | ✅ → [`PROTOCOL_V5.md`](PROTOCOL_V5.md) |
 | 9 | resume de transferencia | ✅ por archivo, dentro de v4 (ver arriba) |

@@ -1,0 +1,254 @@
+// Rendezvous through a rayrelay server (github.com/ray-language/rayrelay), for two peers
+// that cannot reach each other directly (NAT, firewalls). The relay pairs them by a short
+// code and then copies bytes blindly in both directions: takeit's protocol (hello, CPace,
+// AEAD frames) runs unchanged on top, and the relay never learns the password.
+//
+//   sender   → "HOST\n"             ← "CODE xxxx-xxxx\n"  …  ← "PEER\n"   then the pipe
+//   receiver → "JOIN xxxx-xxxx\n"   ← "OK\n" | "ERR <reason>\n"           then the pipe
+//
+// The receiver types ONE code: the relay's code followed by the session password. Only
+// the first part goes to the relay; the rest feeds CPace.
+import std/net;
+import framing;
+import password;
+import progress;
+
+pub const DEFAULT_PORT: int = 7440;
+
+/// A control line longer than this is not a rayrelay talking.
+const MAX_LINE: int = 128;
+
+/// The relay's code without its dash (`xxxxxxxx`).
+const RELAY_CODE_LEN: int = 8;
+
+/// Connect deadline when the idle timeout is disabled.
+const CONNECT_FALLBACK_MS: int = 10000;
+
+pub struct Addr {
+    host: string,
+    port: int,
+}
+
+/// `HOST`, `HOST:PORT`, `[V6]` or `[V6]:PORT`; the port defaults to DEFAULT_PORT. A bare
+/// IPv6 address (several colons, no brackets) is taken whole as the host.
+pub fn parse_addr(raw: string) -> Result<Addr, string> {
+    let s = raw.trim();
+    if (s.len() == 0) {
+        return Result.Err("empty relay address");
+    }
+    if (s.starts_with("[")) {
+        let close_at = match (s.index_of("]")) {
+            Option.None => {
+                return Result.Err("relay address: missing ']' in ${s}");
+            },
+            Option.Some(i) => i,
+        };
+        let host = s.substring(1, close_at);
+        let rest = s.substring(close_at + 1, s.len());
+        if (rest.len() == 0) {
+            return Result.Ok(Addr { host: host, port: DEFAULT_PORT });
+        }
+        if (!rest.starts_with(":")) {
+            return Result.Err("relay address: unexpected '${rest}' after ']'");
+        }
+        return with_port(host, rest.substring(1, rest.len()));
+    }
+    let parts = s.split(":");
+    if (parts.len() == 1) {
+        Result.Ok(Addr { host: s, port: DEFAULT_PORT })
+    } else if (parts.len() == 2) {
+        with_port(parts[0], parts[1])
+    } else {
+        Result.Ok(Addr { host: s, port: DEFAULT_PORT })
+    }
+}
+
+fn with_port(host: string, port_s: string) -> Result<Addr, string> {
+    if (host.len() == 0) {
+        return Result.Err("relay address: empty host");
+    }
+    match (parse_int(port_s)) {
+        Option.Some(p) => {
+            if (p < 1 || p > 65535) {
+                Result.Err("relay address: port out of range: ${port_s}")
+            } else {
+                Result.Ok(Addr { host: host, port: p })
+            }
+        },
+        Option.None => Result.Err("relay address: invalid port: ${port_s}"),
+    }
+}
+
+/// How the address reads back, for messages (`host:port`, IPv6 in brackets).
+pub fn show_addr(a: Addr) -> string {
+    let host = if (a.host.contains(":")) { "[" + a.host + "]" } else { a.host };
+    if (a.port == DEFAULT_PORT) { host } else { host + ":" + to_string(a.port) }
+}
+
+/// What the receiver types: the relay's code, then the session password.
+pub fn joined_code(relay_code: string, pw: string) -> string {
+    relay_code + "-" + pw
+}
+
+/// A joined code taken apart: `relay` goes to the relay, `password` never leaves.
+pub struct Code {
+    relay: string,
+    password: string,
+}
+
+/// Splits a joined code. Dashes, spaces and case do not matter, so a code read aloud
+/// and typed back in another grouping still works.
+pub fn split_code(raw: string) -> Result<Code, string> {
+    let flat = password.normalize(raw);
+    if (flat.len() != RELAY_CODE_LEN + password.NORMALIZED_LEN) {
+        return Result.Err(
+            "malformed code: expected the ${RELAY_CODE_LEN + password.NORMALIZED_LEN} characters the sender printed"
+        );
+    }
+    Result.Ok(
+        Code {
+            relay: flat.substring(0, 4) + "-" + flat.substring(4, RELAY_CODE_LEN),
+            password: flat.substring(RELAY_CODE_LEN, flat.len())
+        }
+    )
+}
+
+/// The sender's side: registers with the relay and returns the connection with the code
+/// the receiver must quote. The receiver has not joined yet: see `wait_peer`.
+pub fn open_host(a: Addr, timeout_ms: int) -> Result<(framing.Conn, string), string> {
+    let c = dial(a, timeout_ms)?;
+    match (host_handshake(c)) {
+        Result.Ok(pair) => Result.Ok(pair),
+        Result.Err(e) => {
+            framing.close_conn(c);
+            Result.Err(e)
+        },
+    }
+}
+
+fn host_handshake(c: framing.Conn) -> Result<(framing.Conn, string), string> {
+    let c1 = write_line(c, "HOST")?;
+    let (c2, line) = read_line(c1)?;
+    if (!line.starts_with("CODE ")) {
+        return Result.Err(refusal(line));
+    }
+    Result.Ok((c2, line.substring(5, line.len())))
+}
+
+/// Blocks until the receiver joins, or until the connection's read timeout fires (the
+/// error is then progress.map_io_err's timeout text).
+pub fn wait_peer(c: framing.Conn) -> Result<framing.Conn, string> {
+    let (c1, line) = read_line(c)?;
+    if (line == "PEER") { Result.Ok(c1) } else { Result.Err(refusal(line)) }
+}
+
+/// The receiver's side: joins the sender waiting under `relay_code`. Bytes the sender
+/// already wrote (its hello) may arrive with the relay's "OK": they stay in the
+/// connection's buffer.
+pub fn join(a: Addr, relay_code: string, timeout_ms: int) -> Result<framing.Conn, string> {
+    let c = dial(a, timeout_ms)?;
+    match (join_handshake(c, relay_code)) {
+        Result.Ok(c1) => Result.Ok(c1),
+        Result.Err(e) => {
+            framing.close_conn(c);
+            Result.Err(e)
+        },
+    }
+}
+
+fn join_handshake(c: framing.Conn, relay_code: string) -> Result<framing.Conn, string> {
+    let c1 = write_line(c, "JOIN " + relay_code)?;
+    let (c2, line) = read_line(c1)?;
+    if (line == "OK") { Result.Ok(c2) } else { Result.Err(refusal(line)) }
+}
+
+fn dial(a: Addr, timeout_ms: int) -> Result<framing.Conn, string> {
+    let connect_ms = if (timeout_ms > 0) { timeout_ms } else { CONNECT_FALLBACK_MS };
+    match (net.tcp_connect_timeout(a.host, a.port, connect_ms)) {
+        Result.Err(e) => Result.Err("could not reach the relay at ${show_addr(a)}: ${e}"),
+        Result.Ok(h) => Result.Ok(framing.set_timeout(framing.from_handle(h), timeout_ms)),
+    }
+}
+
+/// What a relay's unexpected reply means to the user.
+fn refusal(line: string) -> string {
+    if (line == "ERR unknown code") {
+        "the relay knows no sender with that code (mistyped, or the sender is not waiting any more)"
+    } else if (line.starts_with("ERR ")) {
+        "the relay refused: " + line.substring(4, line.len())
+    } else {
+        "unexpected reply from the relay: " + line
+    }
+}
+
+fn write_line(c: framing.Conn, s: string) -> Result<framing.Conn, string> {
+    framing.write_all(c, (s + "\n").to_bytes())
+}
+
+/// One control line (LF, optional CR before it). Whatever the read brought past it stays
+/// in the connection's buffer: it belongs to the peer's stream.
+pub fn read_line(c: framing.Conn) -> Result<(framing.Conn, string), string> {
+    var conn = c;
+    while (true) {
+        if let Option.Some(i) = conn.buf.index_of(b"\n") {
+            var stop = i;
+            if (stop > 0 && conn.buf[stop - 1] == 13) {
+                stop = stop - 1;
+            }
+            let line = from_utf8(conn.buf.sub_bytes(0, stop))?;
+            let rest = conn.buf.sub_bytes(i + 1, conn.buf.len());
+            return Result.Ok((framing.Conn { handle: conn.handle, buf: rest }, line));
+        }
+        if (conn.buf.len() > MAX_LINE) {
+            return Result.Err("unexpected reply from the relay (is that a rayrelay?)");
+        }
+        match (net.socket_read_bytes(conn.handle)) {
+            Result.Err(e) => {
+                return Result.Err(progress.map_io_err(e));
+            },
+            Result.Ok(chunk) => {
+                if (chunk.len() == 0) {
+                    return Result.Err("the relay closed the connection");
+                }
+                conn = framing.Conn { handle: conn.handle, buf: conn.buf + chunk };
+            },
+        }
+    }
+    Result.Err("unreachable")
+}
+
+@test
+fn addresses_parse_with_and_without_port() {
+    let a = parse_addr("relay.example.com").unwrap();
+    assert_eq(a.host, "relay.example.com");
+    assert_eq(a.port, DEFAULT_PORT);
+    let b = parse_addr(" 203.0.113.7:9000 ").unwrap();
+    assert_eq(b.host, "203.0.113.7");
+    assert_eq(b.port, 9000);
+    let c = parse_addr("[2001:db8::1]:7000").unwrap();
+    assert_eq(c.host, "2001:db8::1");
+    assert_eq(c.port, 7000);
+    assert_eq(parse_addr("[::1]").unwrap().port, DEFAULT_PORT);
+    assert_eq(parse_addr("2001:db8::1").unwrap().host, "2001:db8::1");
+    assert(parse_addr("").is_err());
+    assert(parse_addr("host:http").is_err());
+    assert(parse_addr("host:70000").is_err());
+    assert(parse_addr(":7440").is_err());
+    assert(parse_addr("[::1").is_err());
+    assert_eq(show_addr(c), "[2001:db8::1]:7000");
+    assert_eq(show_addr(a), "relay.example.com");
+}
+
+@test
+fn a_joined_code_splits_back_whatever_its_grouping() {
+    let pw = password.generate();
+    let joined = joined_code("rsp3-zceb", pw);
+    let code = split_code(joined).unwrap();
+    assert_eq(code.relay, "rsp3-zceb");
+    assert_eq(code.password, password.normalize(pw));
+    let regrouped = split_code(" RSP3 ZCEB " + password.normalize(pw).to_upper()).unwrap();
+    assert_eq(regrouped.relay, "rsp3-zceb");
+    assert_eq(regrouped.password, code.password);
+    assert(split_code("rsp3-zceb").is_err());
+    assert(split_code(joined + "0").is_err());
+}

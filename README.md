@@ -2,7 +2,7 @@
 
 Transferencia de archivos **peer-to-peer** con cifrado de extremo a extremo, escrita en [raylang](https://github.com/ray-language/raylang).
 
-**Versión actual: `0.4.1` (protocolo v5).** Un equipo envía archivos o carpetas; el otro recibe. No hay cuenta, no hay servidor en la nube, no hay intermediario que vea el contenido: solo TCP, una contraseña de un solo uso, un PAKE (CPace) y AEAD (ChaCha20-Poly1305).
+**Versión actual: `0.5.0` (protocolo v5).** Un equipo envía archivos o carpetas; el otro recibe. No hay cuenta, no hay servidor en la nube, no hay intermediario que vea el contenido: solo TCP, una contraseña de un solo uso, un PAKE (CPace) y AEAD (ChaCha20-Poly1305).
 
 ```text
 # Emisor
@@ -29,6 +29,19 @@ Saved: 205 files in ./inbox/ (300.7 MiB)
 
 Comparte la contraseña por un canal aparte (chat, voz, SMS). Quien no la tenga no puede abrir los chunks.
 
+Si los dos equipos no se ven (NAT, firewalls), se encuentran a través de un
+[rayrelay](https://github.com/ray-language/rayrelay) y el receptor teclea **un solo código**:
+
+```text
+$ takeit send ./informe.pdf --relay relay.example.com
+Code: pk65-xg2s-596e-f044-7391-c1b2
+Waiting on the relay relay.example.com …
+Receiver should run: takeit recv --relay relay.example.com --code pk65-xg2s-596e-f044-7391-c1b2
+
+$ takeit recv --relay relay.example.com --code pk65-xg2s-596e-f044-7391-c1b2
+Saved: ./informe.pdf (1.2 MiB)
+```
+
 ## Estado actual
 
 | Capacidad | Estado |
@@ -41,13 +54,14 @@ Comparte la contraseña por un canal aparte (chat, voz, SMS). Quien no la tenga 
 | Timeouts de idle en accept/lectura (`--timeout`, default 120 s) | ✅ listo |
 | Puerto libre automático (`--port 0` / omitido en send) | ✅ listo |
 | Binarios nativos (Linux, macOS, Windows; x86_64 y ARM64) + `install.sh` / `install.ps1` + CI de releases | ✅ listo |
-| Tests (`roundtrip_test`, `chunk_review_test`) | ✅ listo |
+| Tests (`roundtrip_test`, `chunk_review_test`, `relay_test`) | ✅ listo |
 | Reanudación de una transferencia cortada, por archivo (solo se envía lo que falta) | ✅ listo |
 | Manifiesto cifrado, rutas confinadas al directorio de salida | ✅ listo |
-| Relay / códigos cortos / NAT traversal | ⏳ pendiente |
+| Relay ciego con un solo código (`--relay`, vía [rayrelay](https://github.com/ray-language/rayrelay)) | ✅ listo |
+| Hole punching UDP (conexión directa a través de NAT) | ⏳ pendiente |
 | TLS en el transporte | ⏳ opcional a futuro |
 
-Alcance de red hoy: **P2P directo**. Emisor y receptor deben poder alcanzarse por TCP (misma LAN, IP pública, o túnel).
+Alcance de red hoy: **P2P directo** (emisor y receptor se alcanzan por TCP: misma LAN, IP pública o túnel) o **a través de un relay** que ambos alcancen.
 
 Detalle del protocolo y roadmap: [`docs/PLAN.md`](docs/PLAN.md).
 
@@ -129,8 +143,9 @@ ray test
 ## Uso
 
 ```text
-takeit send <file|dir>... [--bind HOST] [--port N] [--timeout SECS]
+takeit send <file|dir>... [--bind HOST] [--port N] [--relay ADDR] [--timeout SECS]
 takeit recv --host HOST --port N --password PASS [--out PATH] [--timeout SECS] [--fresh]
+takeit recv --relay ADDR --code CODE [--out PATH] [--timeout SECS] [--fresh]
 ```
 
 | Flag | Quién | Qué hace |
@@ -139,11 +154,22 @@ takeit recv --host HOST --port N --password PASS [--out PATH] [--timeout SECS] [
 | `--port` | send / recv | Puerto (en send, omitido o `0` = el SO elige uno libre) |
 | `--host` | recv | IP o hostname del emisor |
 | `--password` | recv | Contraseña mostrada por el emisor |
+| `--relay` | send / recv | Encontrarse a través de un rayrelay en `HOST[:PORT]` (puerto por defecto `7440`; IPv6 como `[::1]:7440`) |
+| `--code` | recv | Con `--relay`: el código que mostró el emisor (guiones, espacios y mayúsculas dan igual) |
 | `--out` | recv | Directorio de destino (default: el actual; se crea si falta). Con un solo archivo puede ser el archivo destino |
 | `--timeout` | ambos | Segundos de idle en accept/lectura; `0` = sin límite (default `120`) |
 | `--fresh` | recv | Ignora los parciales de una transferencia cortada y empieza de cero |
 
 Durante la transferencia, stderr muestra progreso (`sending` / `receiving` con %, velocidad y ETA).
+
+### A través de un relay
+
+Con `--relay`, ninguno de los dos escucha: ambos se conectan al relay, que los empareja y copia
+bytes a ciegas. El código que imprime el emisor es el del relay (`pk65-xg2s`, 8 caracteres) seguido
+de la contraseña de la sesión; `takeit recv` solo le manda al relay la primera parte. El relay no
+puede descifrar ni probar contraseñas (CPace), pero sí ve el hello en claro (número de archivos y
+tamaño total), las IPs y cuánto tráfico pasa. Para montar uno:
+[rayrelay](https://github.com/ray-language/rayrelay) (`rayrelay serve --port 7440`).
 
 ### Reanudar
 
@@ -151,7 +177,7 @@ Si la transferencia se corta, el receptor conserva un `<archivo>.takeit.partial`
 empezado (los ya completos también). Basta con volver a enviar lo mismo (`takeit send`,
 contraseña nueva) y repetir `takeit recv` con el mismo `--out`: el emisor comprueba que cada
 parcial es un prefijo de su archivo (SHA-256) y envía solo lo que falta; el que no lo es, se
-reenvía entero. Ningún archivo aparece en su sitio hasta que el lote completo se verifica.
+reenvía entero. Ningún archivo aparece en su sitio hasta que el lote completo se verifica. Funciona igual con `--relay`.
 
 ```text
 $ takeit recv --host 203.0.113.10 --port 7421 --password …
@@ -170,7 +196,7 @@ Saved: ./informe.pdf (300.0 MiB, resumed at 88.7 MiB)
 7. El receptor rechaza rutas absolutas, con `..` o que resuelvan fuera de `--out` (enlaces simbólicos incluidos).
 8. Emisor y receptor cifran con la misma clave, cada uno en su propio espacio de nonces (tag de dirección).
 
-Protocolo completo: [`docs/PROTOCOL_V5.md`](docs/PROTOCOL_V5.md). Un takeit 0.2/0.3 (v4) y un 0.4 no se entienden: el más antiguo pide actualizar.
+Protocolo completo: [`docs/PROTOCOL_V5.md`](docs/PROTOCOL_V5.md). Un takeit 0.2/0.3 (v4) y uno 0.4 o posterior (v5) no se entienden: el más antiguo pide actualizar.
 
 ## Arquitectura
 
@@ -180,6 +206,7 @@ src/
 ├── password.ray      # generar / normalizar contraseña
 ├── cpace.ray         # PAKE CPace (X25519 + Elligator2), con los vectores del borrador
 ├── framing.ray       # frames u32 BE + buffer de sobrante
+├── relay.ray         # cliente de rayrelay (HOST / JOIN) y el código unido
 ├── protocol.ray      # hello, manifiesto, resume/start, frames AEAD, blobs
 ├── paths.ray         # validación de rutas del manifiesto
 ├── sources.ray       # expansión de archivos/carpetas del emisor
