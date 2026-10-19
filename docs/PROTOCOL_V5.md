@@ -34,7 +34,8 @@ Cada mensaje es un frame `u32 BE length ‖ payload` (`length` no incluye sus 4 
 de más de `MAX_FRAME` = 262 400 B se rechaza.
 
 La conexión es un socket TCP directo (el emisor escucha, el receptor conecta) o un tubo a través de
-un [rayrelay](https://github.com/ray-language/rayrelay) (`--relay`, desde 0.5.0). En ese caso cada
+un [rayrelay](https://github.com/ray-language/rayrelay) (`--relay`, desde 0.5.0; `TAKEIT_RELAY` o el relay de
+fábrica, desde 0.6.0). En ese caso cada
 lado abre antes una línea de control de texto y el protocolo empieza tras ella, sin cambios:
 
 ```text
