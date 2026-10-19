@@ -1,17 +1,25 @@
 // takeit — encrypted end-to-end file transfer.
 import send;
 import recv;
+import relay;
 
 const DEFAULT_TIMEOUT_SECS: int = 120;
 
 fn usage() {
     eprint("usage:");
-    eprint("  takeit send <file|dir>... [--bind HOST] [--port N] [--timeout SECS]");
+    eprint("  takeit send <file|dir>... [--bind HOST] [--port N] [--relay ADDR] [--timeout SECS]");
     eprint(
         "  takeit recv --host HOST --port N --password PASS [--out PATH] [--timeout SECS] [--fresh]"
     );
+    eprint("  takeit recv --relay ADDR --code CODE [--out PATH] [--timeout SECS] [--fresh]");
     eprint("");
     eprint("  send       files go by name, directories recursively under their own name");
+    eprint(
+        "  --relay    meet through a rayrelay at HOST[:PORT] (default port "
+            + to_string(relay.DEFAULT_PORT)
+            + "): for peers behind NAT"
+    );
+    eprint("  --code     recv: the code the sender printed (relay mode)");
     eprint("  --out      recv: target file (one file) or directory (default: current one)");
     eprint(
         "  --timeout  idle seconds (accept/read); 0 = no limit (default "
@@ -33,7 +41,16 @@ fn flag_value(av: [string], name: string) -> Option<string> {
 }
 
 /// Flags that take a value: their value is not a positional argument.
-const VALUED_FLAGS: [string] = ["--bind", "--port", "--timeout", "--host", "--password", "--out"];
+const VALUED_FLAGS: [string] = [
+    "--bind",
+    "--port",
+    "--timeout",
+    "--host",
+    "--password",
+    "--out",
+    "--relay",
+    "--code"
+];
 
 /// The arguments from `from` on that are neither flags nor flag values.
 fn positionals(av: [string], from: int) -> [string] {
@@ -70,6 +87,20 @@ fn timeout_ms_from_args(av: [string]) -> int {
     }
 }
 
+/// `--relay ADDR`, parsed: None when absent; Err (already reported) when malformed.
+fn relay_from_args(av: [string]) -> Result<Option<relay.Addr>, string> {
+    match (flag_value(av, "--relay")) {
+        Option.None => Result.Ok(Option.None),
+        Option.Some(raw) => match (relay.parse_addr(raw)) {
+            Result.Err(e) => {
+                eprint(e);
+                Result.Err(e)
+            },
+            Result.Ok(a) => Result.Ok(Option.Some(a)),
+        },
+    }
+}
+
 fn main() -> int {
     let av = args();
     if (av.len() < 1) {
@@ -91,12 +122,56 @@ fn main() -> int {
             Option.Some(p) => parse_int_or(p, 0),
             Option.None => 0,
         };
+        let via = match (relay_from_args(av)) {
+            Result.Err(_) => {
+                return 1;
+            },
+            Result.Ok(v) => v,
+        };
         send.run(
             send.SendOpts {
                 paths: inputs,
                 bind: bind,
                 port: port,
-                timeout_ms: timeout_ms_from_args(av)
+                timeout_ms: timeout_ms_from_args(av),
+                relay: via
+            }
+        )
+    } else if (cmd == "recv" && av.contains("--relay")) {
+        let via = match (relay_from_args(av)) {
+            Result.Err(_) => {
+                return 1;
+            },
+            Result.Ok(v) => v,
+        };
+        let raw_code = match (flag_value(av, "--code")) {
+            Option.Some(c) => c,
+            Option.None => {
+                usage();
+                return 1;
+            },
+        };
+        let code = match (relay.split_code(raw_code)) {
+            Result.Err(e) => {
+                eprint(e);
+                return 1;
+            },
+            Result.Ok(c) => c,
+        };
+        let out = match (flag_value(av, "--out")) {
+            Option.Some(o) => o,
+            Option.None => "",
+        };
+        recv.run(
+            recv.RecvOpts {
+                host: "",
+                port: 0,
+                password: code.password,
+                out: out,
+                timeout_ms: timeout_ms_from_args(av),
+                resume: !av.contains("--fresh"),
+                relay: via,
+                relay_code: code.relay
             }
         )
     } else if (cmd == "recv") {
@@ -132,7 +207,9 @@ fn main() -> int {
                 password: pw,
                 out: out,
                 timeout_ms: timeout_ms_from_args(av),
-                resume: !av.contains("--fresh")
+                resume: !av.contains("--fresh"),
+                relay: Option.None,
+                relay_code: ""
             }
         )
     } else if (cmd == "--help" || cmd == "-h" || cmd == "help") {

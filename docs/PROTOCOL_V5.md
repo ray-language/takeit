@@ -33,6 +33,22 @@ estados. Complementa [`PLAN.md`](PLAN.md).
 Cada mensaje es un frame `u32 BE length ‖ payload` (`length` no incluye sus 4 octetos). Un frame
 de más de `MAX_FRAME` = 262 400 B se rechaza.
 
+La conexión es un socket TCP directo (el emisor escucha, el receptor conecta) o un tubo a través de
+un [rayrelay](https://github.com/ray-language/rayrelay) (`--relay`, desde 0.5.0). En ese caso cada
+lado abre antes una línea de control de texto y el protocolo empieza tras ella, sin cambios:
+
+```text
+emisor   → "HOST\n"            ← "CODE xxxx-xxxx\n"  …  ← "PEER\n"
+receptor → "JOIN xxxx-xxxx\n"  ← "OK\n" | "ERR <motivo>\n"
+```
+
+Los bytes que lleguen pegados a la línea de control son del peer y quedan en el buffer de la
+conexión. El receptor recibe del usuario un **código unido** `xxxx-xxxx-` + contraseña (24
+caracteres sin guiones): los 8 primeros van al relay y el resto es la contraseña de CPace, que el
+relay nunca ve. El relay sí ve todo lo que va en claro: el hello (`sid`, número de archivos, tamaño
+total, chunk), los mensajes de CPace (que no permiten probar contraseñas) y el tamaño y ritmo del
+tráfico cifrado.
+
 ## Secuencia
 
 ```text
@@ -221,6 +237,6 @@ El prefijo reanudado cuenta en el porcentaje, no en la velocidad ni en el ETA.
 
 ## Fuera de alcance
 
-- Relay / códigos cortos / NAT (fase 6 del plan).
+- Hole punching UDP (conexión directa a través de NAT); el relay solo copia bytes.
 - Compresión, delta por bloques, envío en paralelo.
 - Metadatos (mtime, permisos) y directorios vacíos.

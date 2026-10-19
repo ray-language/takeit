@@ -1,0 +1,241 @@
+// Sessions through a relay: a minimal in-process stand-in for rayrelay (same control
+// lines, a blind pipe after them) on 127.0.0.1, port 0. The real sender and receiver
+// functions run on top, as they do over a direct socket.
+import std/net;
+import std/fs;
+import std/crypto;
+import framing;
+import protocol;
+import password;
+import relay;
+import send;
+import recv;
+import sources;
+
+const CODE: string = "rsp3-zceb";
+
+const CHUNK: int = 64;
+
+fn listen() -> (int, int) {
+    match (net.tcp_listen("127.0.0.1", 0)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(l) => (l, net.local_port(l)),
+    }
+}
+
+fn accept(listener: int) -> framing.Conn {
+    match (net.tcp_accept(listener)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(h) => framing.from_handle(h),
+    }
+}
+
+fn line(c: framing.Conn) -> (framing.Conn, string) {
+    match (relay.read_line(c)) {
+        Result.Err(e) => panic("fake relay: " + e),
+        Result.Ok(pair) => pair,
+    }
+}
+
+fn put(c: framing.Conn, data: bytes) {
+    match (framing.write_all(c, data)) {
+        Result.Err(e) => panic("fake relay: " + e),
+        Result.Ok(_) => { },
+    }
+}
+
+/// One direction of the pipe; EOF goes on as a half-close, like rayrelay's pump.
+fn pump(src: int, dst: int, done: Channel<bool>) {
+    while (true) {
+        match (net.socket_read_bytes(src)) {
+            Result.Err(_) => break,
+            Result.Ok(chunk) => {
+                if (chunk.len() == 0) {
+                    let _ = net.shutdown_write(dst);
+                    break;
+                }
+                if let Result.Err(_) = net.socket_write_bytes(dst, chunk) {
+                    break;
+                }
+            },
+        }
+    }
+    send(done, true);
+}
+
+/// Serves ONE pair: a HOST first, then a JOIN for CODE (any other code is refused and
+/// the next JOIN is awaited). Returns the port.
+fn fake_relay() -> int {
+    let (listener, port) = listen();
+    spawn(fn() {
+        let (host, hello_line) = line(accept(listener));
+        assert_eq(hello_line, "HOST");
+        put(host, ("CODE " + CODE + "\n").to_bytes());
+        var joiner = framing.from_handle(-1);
+        var paired = false;
+        while (!paired) {
+            let (j, request) = line(accept(listener));
+            if (request == "JOIN " + CODE) {
+                joiner = j;
+                paired = true;
+            } else {
+                put(j, b"ERR unknown code\n");
+                framing.close_conn(j);
+            }
+        }
+        close(listener);
+        put(joiner, b"OK\n");
+        put(host, b"PEER\n");
+        let (hh, jh) = (host.handle, joiner.handle);
+        let done: Channel<bool> = Channel.bounded(2);
+        spawn(fn() {
+            pump(hh, jh, done);
+        });
+        spawn(fn() {
+            pump(jh, hh, done);
+        });
+        recv(done);
+        recv(done);
+        close(hh);
+        close(jh);
+    });
+    port
+}
+
+fn at(port: int) -> relay.Addr {
+    relay.Addr { host: "127.0.0.1", port: port }
+}
+
+fn temp_dir() -> string {
+    match (fs.make_temp_dir("takeit_relay_")) {
+        Result.Ok(d) => d,
+        Result.Err(e) => panic(e),
+    }
+}
+
+fn sample(size: int) -> bytes {
+    var octets: [int] = [];
+    var i = 0;
+    while (i < size) {
+        octets.push((i * 13 + i / 97) % 253);
+        i = i + 1;
+    }
+    bytes_of(octets)
+}
+
+@test
+fn a_session_through_the_relay_delivers_the_file() {
+    let dir = temp_dir();
+    let payload = sample(5000);
+    match (fs.write_file_bytes(dir + "/in.bin", payload)) {
+        Result.Err(e) => panic(e),
+        Result.Ok(_) => { },
+    }
+    let files = match (sources.collect([dir + "/in.bin"])) {
+        Result.Err(e) => panic(e),
+        Result.Ok(c) => c.sources,
+    };
+    let port = fake_relay();
+    let (waiting, code) = relay.open_host(at(port), 5000).unwrap();
+    assert_eq(code, CODE);
+    let joined = relay.joined_code(code, password.generate());
+    let done: Channel<Result<recv.Received, string>> = Channel.new();
+
+    spawn(fn() {
+        let typed = relay.split_code(joined).unwrap();
+        let c0 = relay.join(at(port), typed.relay, 5000).unwrap();
+        let got = match (protocol.recv_hello(c0)) {
+            Result.Err(e) => Result.Err(e),
+            Result.Ok(pair) => {
+                let (c1, hello) = pair;
+                match (protocol.auth_as_receiver(c1, typed.password, hello)) {
+                    Result.Err(e) => Result.Err(e),
+                    Result.Ok(auth) => {
+                        let (c2, key) = auth;
+                        recv.receive_files(c2, key, hello, dir + "/out.bin", true)
+                    },
+                }
+            },
+        };
+        framing.close_conn(c0);
+        send(done, got);
+    });
+
+    let c0 = relay.wait_peer(waiting).unwrap();
+    let hello = protocol.Hello {
+        sid: crypto.random_bytes(protocol.SID_LEN),
+        file_count: 1,
+        total_size: payload.len(),
+        chunk_size: CHUNK
+    };
+    let c1 = protocol.send_hello(c0, hello).unwrap();
+    let pw = relay.split_code(joined).unwrap().password;
+    let (c2, key) = protocol.auth_as_sender(c1, pw, hello).unwrap();
+    let sent = send.stream_files(c2, key, files, CHUNK);
+    framing.close_conn(c2);
+    match (sent) {
+        Result.Err(e) => panic("sender: " + e),
+        Result.Ok(s) => assert_eq(s.sent, payload.len()),
+    }
+    match (recv(done)) {
+        Option.Some(Result.Ok(got)) => assert_eq(got.total, payload.len()),
+        Option.Some(Result.Err(e)) => panic("receiver: " + e),
+        Option.None => panic("receiver fiber vanished"),
+    }
+    assert(fs.read_file_bytes(dir + "/out.bin").unwrap() == payload);
+    let _ = fs.remove_all(dir);
+}
+
+@test
+fn an_unknown_code_is_refused_with_a_readable_error() {
+    let port = fake_relay();
+    let (waiting, code) = relay.open_host(at(port), 5000).unwrap();
+    match (relay.join(at(port), "zzzz-zzzz", 5000)) {
+        Result.Ok(_) => panic("the relay should have refused the code"),
+        Result.Err(e) => assert(e.contains("knows no sender")),
+    }
+    // The sender is still waiting: the right code pairs.
+    let c = relay.join(at(port), code, 5000).unwrap();
+    let w = relay.wait_peer(waiting).unwrap();
+    framing.close_conn(c);
+    framing.close_conn(w);
+}
+
+@test
+fn bytes_glued_to_the_relays_ok_stay_in_the_stream() {
+    let (listener, port) = listen();
+    spawn(fn() {
+        let (c, request) = line(accept(listener));
+        assert_eq(request, "JOIN " + CODE);
+        put(c, b"OK\nearly bytes");
+        close(listener);
+    });
+    let c = relay.join(at(port), CODE, 5000).unwrap();
+    let (c1, early) = framing.read_exact(c, 11).unwrap();
+    assert(early == b"early bytes");
+    framing.close_conn(c1);
+}
+
+@test
+fn a_relay_nobody_runs_fails_to_connect() {
+    let (listener, port) = listen();
+    close(listener);
+    match (relay.open_host(at(port), 2000)) {
+        Result.Ok(_) => panic("nothing listens there"),
+        Result.Err(e) => assert(e.contains("could not reach the relay")),
+    }
+}
+
+@test
+fn a_sender_nobody_joins_times_out() {
+    let port = fake_relay();
+    let (waiting, code) = relay.open_host(at(port), 300).unwrap();
+    match (relay.wait_peer(waiting)) {
+        Result.Ok(_) => panic("nobody joined"),
+        Result.Err(e) => assert(e.contains("timed out")),
+    }
+    framing.close_conn(waiting);
+    // Let the fake relay finish its one pair.
+    let late = relay.join(at(port), code, 2000).unwrap();
+    framing.close_conn(late);
+}
