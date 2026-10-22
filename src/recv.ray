@@ -19,6 +19,8 @@ pub struct RecvOpts {
     timeout_ms: int,
     /// Resume from the `*.takeit.partial` files an interrupted transfer left (default).
     resume: bool,
+    /// Replace files that already exist at the destination (off: refuse before receiving).
+    overwrite: bool,
     /// Join the sender through this rayrelay (`host`/`port` unused), under `relay_code`.
     relay: Option<relay.Addr>,
     relay_code: string,
@@ -48,7 +50,7 @@ pub fn run(opts: RecvOpts) -> int {
                     eprint(
                         "receiving " + what + " (" + progress.format_bytes(hello.total_size) + ")"
                     );
-                    receive_files(c2, key, hello, opts.out, opts.resume)
+                    receive_files(c2, key, hello, opts.out, opts.resume, opts.overwrite)
                 },
             }
         },
@@ -170,6 +172,28 @@ fn check_local_names(entries: [protocol.Entry]) -> Result<int, string> {
         }
     }
     Result.Ok(0)
+}
+
+/// Refuses, before anything is received, destinations that already exist: the sender
+/// picks the names, and a file of the same name here would be replaced without a word.
+/// `--overwrite` allows it.
+fn check_not_there(p: Plan) -> Result<int, string> {
+    var taken: [string] = [];
+    for f in p.finals {
+        match (fs.stat(f)) {
+            Result.Ok(_) => taken.push(f),
+            Result.Err(_) => { },
+        }
+    }
+    if (taken.len() == 0) {
+        return Result.Ok(0);
+    }
+    let shown = if (taken.len() <= 3) {
+        builtin.join(taken, ", ")
+    } else {
+        builtin.join(taken.slice(0, 3), ", ") + " and ${taken.len() - 3} more"
+    };
+    Result.Err("already exists: ${shown} (use --overwrite to replace, or --out to save elsewhere)")
 }
 
 /// Refuses a destination whose existing parent resolves outside `base` (a symlinked
@@ -356,13 +380,17 @@ pub fn receive_files(
     key: bytes,
     hello: protocol.Hello,
     out: string,
-    resume: bool
+    resume: bool,
+    overwrite: bool
 ) -> Result<Received, string> {
     let l0 = protocol.link(c, key, protocol.FROM_RECEIVER, hello.total_size);
     let (l1, mblob) = protocol.recv_blob(l0, protocol.KIND_MANIFEST)?;
     let entries = protocol.decode_manifest(mblob, hello)?;
     check_local_names(entries)?;
     let p = plan(entries, out);
+    if (!overwrite) {
+        check_not_there(p)?;
+    }
     let k = streamhash.kept();
     let outcome = offer_and_receive(l1, hello, entries, p, resume, k);
     streamhash.release(k);

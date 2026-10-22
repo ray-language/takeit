@@ -85,6 +85,18 @@ fn session_with(
     resume: bool,
     serve: fn(framing.Conn, bytes) -> Result<send.Sent, string>
 ) -> Session {
+    session_full(count, total, out, resume, false, serve)
+}
+
+/// session_with, choosing whether the receiver may replace existing files.
+fn session_full(
+    count: int,
+    total: int,
+    out: string,
+    resume: bool,
+    overwrite: bool,
+    serve: fn(framing.Conn, bytes) -> Result<send.Sent, string>
+) -> Session {
     let listener = match (net.tcp_listen("127.0.0.1", 0)) {
         Result.Err(e) => panic(e),
         Result.Ok(l) => l,
@@ -107,7 +119,7 @@ fn session_with(
                     Result.Err(e) => Result.Err(e),
                     Result.Ok(auth) => {
                         let (c2, key_r) = auth;
-                        recv.receive_files(c2, key_r, hello, out, resume)
+                        recv.receive_files(c2, key_r, hello, out, resume, overwrite)
                     },
                 }
             },
@@ -150,6 +162,16 @@ fn session(args: [string], out: string, resume: bool) -> Session {
     session_with(files.len(), sources.total_size(
         files
     ), out, resume, fn(c: framing.Conn, key: bytes) -> Result<send.Sent, string> {
+        send.stream_files(c, key, files, CHUNK)
+    })
+}
+
+/// session, choosing whether the receiver may replace existing files.
+fn session_overwriting(args: [string], out: string, overwrite: bool) -> Session {
+    let files = collect(args);
+    session_full(files.len(), sources.total_size(
+        files
+    ), out, true, overwrite, fn(c: framing.Conn, key: bytes) -> Result<send.Sent, string> {
         send.stream_files(c, key, files, CHUNK)
     })
 }
@@ -539,4 +561,24 @@ fn a_hello_altered_in_transit_fails_authentication() {
     let (sent, got) = handshake("abc", "abc", h, forged);
     assert(sent.is_err());
     assert(got.is_err());
+}
+
+@test
+fn an_existing_file_is_not_replaced_without_overwrite() {
+    let dir = temp_dir();
+    let root = make_tree(dir);
+    write(dir + "/out/fotos/x.jpg", b"mine");
+    let e = expect_receiver_error(
+        session_overwriting([root + "/a.txt", root + "/fotos"], dir + "/out", false)
+    );
+    assert(e.contains("already exists"));
+    assert(e.contains("fotos/x.jpg"));
+    // Nothing was received: no partials, the existing file untouched.
+    assert(read(dir + "/out/fotos/x.jpg") == b"mine");
+    assert(!fs.exists(dir + "/out/a.txt"));
+    assert(!fs.exists(recv.partial_path(dir + "/out/a.txt")));
+    // With --overwrite it is replaced.
+    expect_ok(session_overwriting([root + "/a.txt", root + "/fotos"], dir + "/out", true));
+    assert(read(dir + "/out/fotos/x.jpg") == sample(1000, 2));
+    let _ = fs.remove_all(dir);
 }
