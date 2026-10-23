@@ -147,8 +147,8 @@ ray test
 
 ```text
 takeit send <file|dir>... [--relay ADDR | --direct [--bind HOST] [--port N]] [--timeout SECS]
-takeit recv CODE [--relay ADDR] [--out PATH] [--timeout SECS] [--fresh]
-takeit recv --host HOST --port N --password PASS [--out PATH] [--timeout SECS] [--fresh]
+takeit recv CODE [--relay ADDR] [--out PATH] [--timeout SECS] [--fresh] [--overwrite]
+takeit recv --host HOST --port N --password PASS [--out PATH] [--timeout SECS] [--fresh] [--overwrite]
 ```
 
 | Flag | Quién | Qué hace |
@@ -163,6 +163,7 @@ takeit recv --host HOST --port N --password PASS [--out PATH] [--timeout SECS] [
 | `--out` | recv | Directorio de destino (default: el actual; se crea si falta). Con un solo archivo puede ser el archivo destino |
 | `--timeout` | ambos | Segundos de idle en accept/lectura; `0` = sin límite (default `120`) |
 | `--fresh` | recv | Ignora los parciales de una transferencia cortada y empieza de cero |
+| `--overwrite` | recv | Reemplaza los archivos que ya existan en el destino. Sin él, si alguno existe, `recv` se niega antes de recibir nada y dice cuáles |
 
 Durante la transferencia, stderr muestra progreso (`sending` / `receiving` con %, velocidad y ETA).
 

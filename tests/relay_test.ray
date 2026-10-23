@@ -152,7 +152,7 @@ fn a_session_through_the_relay_delivers_the_file() {
                     Result.Err(e) => Result.Err(e),
                     Result.Ok(auth) => {
                         let (c2, key) = auth;
-                        recv.receive_files(c2, key, hello, dir + "/out.bin", true)
+                        recv.receive_files(c2, key, hello, dir + "/out.bin", true, false)
                     },
                 }
             },
